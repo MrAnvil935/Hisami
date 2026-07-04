@@ -1,0 +1,22 @@
+{
+  "discord_token": "Put discord token here",
+  "openrouter_api_key": "Put openrouter key here",
+  "model": "nvidia/nemotron-3-ultra-550b-a55b-20260604:free",
+  "fallback_model": "openrouter/free",
+  "ollama_url": "http://localhost:11434/api/chat",
+  "ollama_model": "gemma4:12b",
+  "ollama_max_tokens": 4096,
+  "ollama_timeout": 240,
+  "max_history": 50,
+  "max_examples": 20,
+  "botname": "Hisami",
+  "clear_command_name": "clearmemory",
+  "clear_command_description":"Removes messages from bot's memory",
+  "clear_command_text": "Done",
+  "randomimage_command_name": "randomimage",
+  "randomimage_command_description": "Sends you a random image",
+  "randomimage_command_text": "Check your dms",
+  "status_command_name": "status",
+  "status_command_description": "Shows bot status.",
+  "master_prompt": "You are discord bot roleplaying as a Discord user. Keep responses natural, short, and informal."
+}
