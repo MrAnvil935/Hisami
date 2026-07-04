@@ -426,8 +426,36 @@ def generate_openrouter_response(prompt, use_fallback=False):
         print("-" * 80)
         # ----------------------
 
+        data = r.json()
+
+        # OpenRouter sometimes returns HTTP 200 with an embedded error.
+        if "error" in data:
+            error = data["error"]
+            message = error.get("message", "")
+            code = error.get("code")
+
+            print(f"Embedded OpenRouter error ({code}): {message}")
+
+            # Treat temporary upstream failures as retryable.
+            if code in (429, 502, 503, 504):
+                delay = (1.5 ** attempt) + random.uniform(0, 1)
+                print(
+                    f"[{model_to_use}] Embedded HTTP {code} → "
+                    f"retry {attempt + 1}/{MAX_RETRIES} in {delay:.2f}s"
+                )
+                time.sleep(delay)
+                continue
+
+            # Daily quota exhausted
+            if "free-models-per-day" in message:
+                return None
+
+            # Anything else: give up on this model
+            return None
+
+        # Normal successful response
         if r.status_code == 200:
-            text = r.json()["choices"][0]["message"]["content"].strip()
+            text = data["choices"][0]["message"]["content"].strip()
 
             if use_fallback:
                 text = f"-# [fallback: {model_to_use}]\n{text}"
