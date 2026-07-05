@@ -548,7 +548,7 @@ async def clear_memory(interaction: discord.Interaction):
     conversation_history[channel_id].clear()
 
     await interaction.followup.send(
-        {CLEAR_COMMAND_TEXT},
+        CLEAR_COMMAND_TEXT,
         ephemeral=False  # set True if you want only the user to see it
     )
     
