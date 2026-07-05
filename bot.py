@@ -703,8 +703,8 @@ async def on_message(message):
             # 2) OpenRouter primary model
             if reply is None:
                 print(f"Using OpenRouter ({MODEL})")
-                reply =await asyncio.to_thread(
-                  generate_openrouter_response,
+                reply = await asyncio.to_thread(
+                    generate_openrouter_response,
                     prompt,
                     use_fallback=False
                 )
