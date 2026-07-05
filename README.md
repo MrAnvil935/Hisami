@@ -110,6 +110,8 @@ pip install -r requirements.txt
 python bot.py
 ```
 
+Make sure ollama server is running as at minimum you need access to nomic-embed-text. If you want to also use local model for generation you have to load it manually and then bot will try to use it as 1st option. 
+
 ---
 
 ## Project Structure
