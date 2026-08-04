@@ -295,7 +295,7 @@ STYLE PROFILE:
 
         prompt += text + "\n"
 
-    prompt += f"\n{username}: {user_message}\n{ASSISTANT_NAME}:"
+    prompt += f"\nPrompt:\n{username}: {user_message}\n{ASSISTANT_NAME}:"
 
     return prompt
 
