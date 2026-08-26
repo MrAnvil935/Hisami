@@ -18,5 +18,10 @@
   "randomimage_command_text": "Check your dms",
   "status_command_name": "status",
   "status_command_description": "Shows bot status.",
+  "search_enabled": true,
+  "search_max_results": 4,
+  "search_short_message_words": 5,
+  "search_timeout": 15,
+  "search_triggers": ["?", "latest", "news", "today", "what is", "price"],
   "master_prompt": "You are discord bot roleplaying as a Discord user. Keep responses natural, short, and informal."
 }
