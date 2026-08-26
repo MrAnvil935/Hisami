@@ -9,6 +9,8 @@ import os
 import time
 import re
 import asyncio
+from urllib.parse import unquote, urlparse, parse_qs
+from bs4 import BeautifulSoup
 from collections import defaultdict
 
 START_TIME = time.time()
@@ -245,6 +247,234 @@ def retrieve_examples(channel_id, user_message, limit=MAX_EXAMPLES):
     return [text for _, text in scored[:limit]]
 
 # ============================================================
+# WEB SEARCH
+# ============================================================
+
+SEARCH_ENABLED = config.get("search_enabled", True)
+SEARCH_MAX_RESULTS = config.get("search_max_results", 4)
+
+# max words in the user message before we stop gluing on context
+SEARCH_SHORT_MESSAGE_WORDS = config.get("search_short_message_words", 5)
+
+SEARCH_TRIGGERS = tuple(config.get("search_triggers", [
+    "?",
+    "latest",
+    "news",
+    "today",
+    "who is",
+    "what is",
+    "when did",
+    "where is",
+    "price",
+    "weather",
+    "score",
+    "release",
+]))
+
+
+SEARCH_TIMEOUT = config.get("search_timeout", 15)
+
+_search_session = requests.Session()
+DDG_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://duckduckgo.com/",
+}
+
+
+def _decode_ddg_href(href):
+    """
+    Result links are wrapped in redirects like:
+      //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=abc
+    Unwrap them so the model sees clean URLs.
+    """
+    if not href:
+        return ""
+
+    if "uddg=" in href:
+        qs = parse_qs(urlparse(href).query)
+        if qs.get("uddg"):
+            return unquote(qs["uddg"][0])
+
+    if href.startswith("//"):
+        return "https:" + href
+
+    return href
+
+
+def _is_bot_page(html_text):
+    # DDG serves a challenge page instead of results when it
+    # doesn't trust your traffic (usually alongside HTTP 202)
+    markers = ("anomaly-modal", "bots use DuckDuckGo", "challenge-form")
+    return any(m in html_text for m in markers)
+
+
+def _parse_html_results(html_text, max_results):
+    soup = BeautifulSoup(html_text, "html.parser")   # stdlib parser, no lxml
+
+    results = []
+
+    for res in soup.select("div.result"):
+
+        classes = res.get("class") or []
+
+        # skip ads / "more results" stubs
+        if any(c in ("result--ad", "result--more") for c in classes):
+            continue
+
+        link = res.select_one("a.result__a")
+        if not link:
+            continue
+
+        snippet_el = res.select_one(".result__snippet")
+
+        results.append({
+            "title": link.get_text(" ", strip=True),
+            "url": _decode_ddg_href(link.get("href")),
+            "snippet": snippet_el.get_text(" ", strip=True) if snippet_el else "",
+        })
+
+        if len(results) >= max_results:
+            break
+
+    return results
+
+
+def _parse_lite_results(html_text, max_results):
+    """
+    Fallback parser for lite.duckduckgo.com — simpler table layout
+    that's also more tolerant of scraper traffic.
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    results = []
+
+    for link in soup.select("a.result-link"):
+
+        row = link.find_parent("tr")
+        snippet_el = None
+
+        if row is not None:
+            next_row = row.find_next_sibling("tr")
+            if next_row is not None:
+                snippet_el = next_row.select_one(".result-snippet")
+
+        results.append({
+            "title": link.get_text(" ", strip=True),
+            "url": _decode_ddg_href(link.get("href")),
+            "snippet": snippet_el.get_text(" ", strip=True) if snippet_el else "",
+        })
+
+        if len(results) >= max_results:
+            break
+
+    return results
+
+
+def _ddg_request(endpoint, query):
+    return _search_session.post(
+        endpoint,
+        data={"q": query},
+        headers=DDG_HEADERS,
+        timeout=SEARCH_TIMEOUT,
+    )
+
+
+def web_search(query, max_results=SEARCH_MAX_RESULTS):
+    try:
+        r = _ddg_request("https://html.duckduckgo.com/html/", query)
+        r.raise_for_status()
+
+        # ---- soft bot block: retry once against the lite endpoint ----
+        if r.status_code == 202 or _is_bot_page(r.text):
+            print("[search] DDG bot-check on html endpoint, trying lite")
+            r = _ddg_request("https://lite.duckduckgo.com/lite/", query)
+            r.raise_for_status()
+
+            if r.status_code == 202 or _is_bot_page(r.text):
+                print("[search] DDG blocked both endpoints")
+                return []
+
+            return _parse_lite_results(r.text, max_results)
+
+        return _parse_html_results(r.text, max_results)
+
+    except Exception as e:
+        print("Web search failed:", e)
+        return []
+
+
+def should_search(text):
+    t = text.lower()
+
+    return any(trigger in t for trigger in SEARCH_TRIGGERS)
+
+
+def clean_for_search(text):
+    # strip discord mention/channel tags and collapse whitespace
+    text = re.sub(r"<@!?\d+>", "", text)
+    text = re.sub(r"<#\d+>", "", text)
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def build_web_query(channel_id, user_message):
+    """
+    Normally search the raw user message only.
+
+    Short follow-ups like "is that real?" have no subject on
+    their own, so we prepend the previous message in that case.
+
+    NOTE: by the time this runs, the current message has ALREADY
+    been appended to history in on_message, so [-2:-1] is the
+    *previous* message, not the current one.
+    """
+    if len(user_message.split()) <= SEARCH_SHORT_MESSAGE_WORDS:
+        prev = conversation_history[channel_id][-2:-1]
+
+        if prev:
+            prev_text = clean_for_search(prev[0]["content"])[:120]
+            return f"{prev_text} {user_message}".strip()
+
+    return clean_for_search(user_message)
+
+
+def get_web_context(channel_id, user_message):
+    """
+    Returns a formatted prompt section, or '' if no search
+    should happen / nothing was found.
+    """
+
+    if not SEARCH_ENABLED:
+        return ""
+
+    if not should_search(user_message):
+        return ""
+
+    query = build_web_query(channel_id, user_message)
+
+    print(f"[search] {query!r}")
+
+    results = web_search(query)
+
+    if not results:
+        return ""
+
+    lines = [
+        f"- {r['title']} ({r['url']}): {r['snippet']}"
+        for r in results
+    ]
+
+    return (
+        "\nWeb results:\n"
+        + "\n".join(lines)
+        + "\n(Use these only if relevant to the conversation.)\n"
+    )
+# ============================================================
 # PROMPT
 # ============================================================
 
@@ -254,6 +484,10 @@ def build_prompt(channel_id, user_message, username):
       channel_id,
       user_message
  )
+    web_block = get_web_context(
+      channel_id,
+      user_message
+ ) 
 
     prompt = f"""
 {MASTER_PROMPT}
@@ -269,6 +503,10 @@ STYLE PROFILE:
         prompt += "\nExamples:\n"
         for ex in examples:
             prompt += f"- {ex}\n"
+        
+   if web_block:              
+       prompt += web_block    
+
 
     prompt += "\nConversation:\n"
 
