@@ -20,6 +20,7 @@
   "status_command_description": "Shows bot status.",
   "prompt_command_name": "prompt",
   "prompt_command_description": "Interact with the LLM directly",
+  "prompt_system": "You are a helpful assistant.",
   "search_enabled": true,
   "search_max_results": 4,
   "search_short_message_words": 5,
