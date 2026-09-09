@@ -617,6 +617,10 @@ async def openrouter_chat(messages, model, tag_as_fallback=False):
 
         try:
             data = r.json()
+
+            print(f"[{model}] OpenRouter response:")
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+
         except Exception:
             data = {}
 
