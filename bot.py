@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import logging
 import os
 import random
 import re
@@ -8,6 +9,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
+from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, unquote, urlparse
 
 import discord
@@ -15,6 +17,25 @@ import hnswlib
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
+
+from memory import buffer as mem_buffer
+from memory import examples as mem_examples
+from memory import facts as mem_facts
+from memory import llmlog as mem_llmlog
+from memory import recall as mem_recall
+from memory import store as mem_store
+from memory import summary as mem_summary
+
+# Console (terminal) stays concise at INFO. Full bodies go to the
+# rotating file log + llm.jsonl, wired up after config load below.
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+_root_logger.addHandler(_console_handler)
+log = logging.getLogger("hisami")
 
 START_TIME = time.time()
 
@@ -41,6 +62,7 @@ PROMPT_SYSTEM = config.get("prompt_system", "You are a helpful assistant.")
 
 MAX_HISTORY = config["max_history"]
 MAX_EXAMPLES = config["max_examples"]
+EXAMPLES_MAX_TOKENS = config.get("examples_max_tokens", 1200)
 
 OLLAMA_URL = config["ollama_url"]
 OLLAMA_MODEL = config["ollama_model"]
@@ -48,6 +70,83 @@ MAX_OLLAMA_TOKENS = config["ollama_max_tokens"]
 OLLAMA_TIMEOUT = config["ollama_timeout"]
 
 BOTNAME = config["botname"]
+
+# ---- persistent memory settings ----
+MEMORY_DB_PATH = config.get("memory_db_path", "memory.db")
+MEMORY_BUFFER_TOKENS = config.get("memory_buffer_tokens", 1500)
+MEMORY_BUFFER_MAX_MSGS = config.get("memory_buffer_max_msgs", 30)
+MEMORY_SUMMARY_CHUNK = config.get("memory_summary_chunk", 40)
+MEMORY_FACTS_ENABLED = config.get("memory_facts_enabled", True)
+MEMORY_RECALL_ENABLED = config.get("memory_recall_enabled", True)
+MEMORY_RECALL_LIMIT = config.get("memory_recall_limit", 3)
+COOLDOWN_SECONDS = config.get("cooldown_seconds", 5)
+MEMORY_PRUNE_KEEP = config.get("memory_prune_keep", 200)
+
+# ---- background summarizer: separate local-first chain ----
+# User tunes both model names via config. Local summary model is tried
+# first (only when loaded); OpenRouter summary model is last resort.
+SUMMARY_OLLAMA_MODEL = config.get("summary_ollama_model", "gemma3n:e4b")
+SUMMARY_MODEL = config.get("summary_model", "openrouter/free")
+SUMMARY_TEMPERATURE = config.get("summary_temperature", 0.2)
+SUMMARY_MAX_TOKENS = config.get("summary_max_tokens", 500)
+SUMMARY_OLLAMA_TIMEOUT = config.get("summary_ollama_timeout", 60)
+SUMMARY_TIMEOUT = config.get("summary_timeout", 60)
+SUMMARY_MAX_RETRIES = config.get("summary_max_retries", 1)
+SUMMARY_INTERVAL = config.get("summary_interval", 300)
+SUMMARY_OLLAMA_CTX = config.get("summary_ollama_ctx", 2048)
+
+# ---- static style profile (hand-reviewed persona blurb) ----
+STYLE_PROFILE_PATH = config.get("style_profile_path", "style_profile.txt")
+STYLE_PROFILE_ENABLED = config.get("style_profile_enabled", True)
+STYLE_PROFILE_MAX_CHARS = config.get("style_profile_max_chars", 2000)
+
+
+def _load_style_profile():
+    if not STYLE_PROFILE_ENABLED:
+        return ""
+    try:
+        with open(STYLE_PROFILE_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+    except Exception as e:
+        log.warning("style profile load failed: %s", e)
+        return ""
+
+
+STYLE_PROFILE_TEXT = _load_style_profile()
+
+# ---- debug logging: terminal stays concise, files get everything ----
+LOG_DIR = config.get("log_dir", "logs")
+LOG_FILE_LEVEL = config.get("log_file_level", "DEBUG")
+LOG_MAX_BYTES = config.get("log_max_bytes", 5242880)
+LOG_BACKUPS = config.get("log_backups", 3)
+LLM_DUMP_ENABLED = config.get("llm_dump_enabled", True)
+
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    _file_handler = RotatingFileHandler(
+        os.path.join(LOG_DIR, "bot.log"),
+        maxBytes=int(LOG_MAX_BYTES), backupCount=int(LOG_BACKUPS),
+        encoding="utf-8",
+    )
+    _file_handler.setLevel(getattr(logging, str(LOG_FILE_LEVEL).upper(), logging.DEBUG))
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    _root_logger.addHandler(_file_handler)
+except Exception as e:
+    log.warning("file logging setup failed: %s", e)
+
+mem_llmlog.configure(LOG_DIR, LLM_DUMP_ENABLED,
+                      max_bytes=LOG_MAX_BYTES, backups=LOG_BACKUPS)
+
+mem_store.configure(MEMORY_DB_PATH)
+mem_store.init_db()
+
+# per-user cooldowns + per-channel generation locks (reliability)
+_last_call = {}
+_channel_locks = defaultdict(asyncio.Lock)
+_openrouter_failures = 0
 
 CLEAR_COMMAND_NAME = config["clear_command_name"]
 CLEAR_COMMAND_DESCRIPTION = config["clear_command_description"]
@@ -106,11 +205,11 @@ def load_index():
         idx.load_index("index.bin")
         idx.set_ef(50)  # recommended for query speed/quality
 
-        print(f"Loaded HNSW index with {len(texts)} entries")
+        log.info("Loaded HNSW index with %d entries", len(texts))
         return idx, texts
 
     except Exception as e:
-        print("Index load failed:", e)
+        log.warning("Index load failed: %s", e)
         return None, []
 
 
@@ -120,25 +219,48 @@ index, indexed_texts = load_index()
 indexed_tokens = [set(text.lower().split()) for text in indexed_texts]
 
 # ============================================================
-# MEMORY
+# MEMORY (persistent, SQLite-backed)
 # ============================================================
 
-conversation_history = defaultdict(list)
+# NOTE: short-term buffer lives in SQLite (memory/store.py), not RAM.
+# Summaries + user_facts provide long-term memory. See memory/ package.
 
 
-def add_message(channel_id, message_id, author, role, content, reply_to=None):
-    history = conversation_history[channel_id]
+def _history_compat(channel_id):
+    """Return history in the legacy dict shape for prompt builders.
 
-    history.append({
-        "id": message_id,
-        "author": author,
-        "role": role,
-        "content": content,
-        "reply_to": reply_to,
-    })
+    Legacy keys: id / author / role / content / reply_to.
+    """
+    rows = mem_buffer.load_window(
+        channel_id,
+        budget_tokens=MEMORY_BUFFER_TOKENS,
+        max_messages=MEMORY_BUFFER_MAX_MSGS,
+    )
+    return [
+        {
+            "id": r["msg_id"],
+            "author": r["author_name"],
+            "author_id": r.get("author_id", ""),
+            "role": r.get("role", "user"),
+            "content": r.get("content", ""),
+            "reply_to": r.get("reply_to"),
+        }
+        for r in rows
+    ]
 
-    if len(history) > MAX_HISTORY:
-        del history[:len(history) - MAX_HISTORY]
+
+def add_message(channel_id, message_id, author, role, content, reply_to=None,
+                author_id=""):
+    mem_store.add_message(
+        channel_id, message_id, author_id, author,
+        role, content, reply_to,
+    )
+    # prune runs inside to_thread callers; keep it cheap: prune async occasionally
+    try:
+        if mem_store.get_message_count(channel_id) > MEMORY_PRUNE_KEEP + 20:
+            mem_store.prune_channel(channel_id, keep=MEMORY_PRUNE_KEEP)
+    except Exception:
+        log.exception("prune failed")
 
 # ============================================================
 # EMBEDDING
@@ -165,7 +287,7 @@ def build_search_query(channel_id, user_message):
     Older messages contribute less because we only keep the
     last ~8 exchanges.
     """
-    history = conversation_history[channel_id][-8:]
+    history = _history_compat(channel_id)[-8:]
     parts = [f"{msg['author']}: {msg['content']}" for msg in history]
     parts.append(user_message)
     return "\n".join(parts)
@@ -175,8 +297,15 @@ def embedding_search(search_text, k):
     if index is None:
         return []
 
-    vec = np.array([get_embedding(search_text)], dtype="float32")
-    labels, distances = index.knn_query(vec, k=min(k * 6, len(indexed_texts)))
+    try:
+        vec = np.array([get_embedding(search_text)], dtype="float32")
+        labels, distances = index.knn_query(vec, k=min(k * 6, len(indexed_texts)))
+    except Exception:
+        # Ollama down (or any embedding failure) -> fail soft so keyword
+        # search + OpenRouter generation still work. Logged once per call
+        # at debug to avoid spamming logs on every message while offline.
+        log.debug("embedding_search failed (Ollama offline?), skipping", exc_info=True)
+        return []
 
     results = []
     for idx, dist in zip(labels[0], distances[0]):
@@ -373,7 +502,7 @@ def web_search(query, max_results=SEARCH_MAX_RESULTS):
 
         # ---- soft bot block: retry once against the lite endpoint ----
         if r.status_code == 202 or _is_bot_page(r.text):
-            print("[search] DDG bot-check on html endpoint, trying lite")
+            log.info("[search] DDG bot-check on html endpoint, trying lite")
 
             r = http.post(
                 "https://lite.duckduckgo.com/lite/",
@@ -384,7 +513,7 @@ def web_search(query, max_results=SEARCH_MAX_RESULTS):
             r.raise_for_status()
 
             if r.status_code == 202 or _is_bot_page(r.text):
-                print("[search] DDG blocked both endpoints")
+                log.warning("[search] DDG blocked both endpoints")
                 return []
 
             return _parse_lite_results(r.text, max_results)
@@ -392,7 +521,7 @@ def web_search(query, max_results=SEARCH_MAX_RESULTS):
         return _parse_html_results(r.text, max_results)
 
     except Exception as e:
-        print("Web search failed:", e)
+        log.warning("Web search failed: %s", e)
         return []
 
 
@@ -421,7 +550,7 @@ def build_web_query(channel_id, user_message):
     *previous* message, not the current one.
     """
     if len(user_message.split()) <= SEARCH_SHORT_MESSAGE_WORDS:
-        prev = conversation_history[channel_id][-2:-1]
+        prev = _history_compat(channel_id)[-2:-1]
 
         if prev:
             prev_text = clean_for_search(prev[0]["content"])[:120]
@@ -439,7 +568,7 @@ async def get_web_context(channel_id, user_message):
         return ""
 
     query = build_web_query(channel_id, user_message)
-    print(f"[search] {query!r}")
+    log.info("[search] %r", query)
 
     results = await asyncio.to_thread(web_search, query)
 
@@ -459,33 +588,94 @@ async def get_web_context(channel_id, user_message):
 # ============================================================
 
 
-async def build_prompt(channel_id, user_message, username):
-    # Retrieval and web search are independent — run them concurrently.
-    examples, web_block = await asyncio.gather(
+async def get_memory_context(channel_id, user_message, author_id=""):
+    """Fetch long-term memory: summaries + recalled messages + user facts.
+
+    Runs SQLite lookups in threads; returns a formatted prompt section.
+    Fail-soft: any error -> ''.
+    """
+    try:
+        summaries, recalled, facts = await asyncio.gather(
+            asyncio.to_thread(
+                mem_store.search_summaries, channel_id, user_message, 2),
+            asyncio.to_thread(
+                mem_recall.search_messages, channel_id, user_message,
+                MEMORY_RECALL_LIMIT) if MEMORY_RECALL_ENABLED
+            else asyncio.sleep(0, result=[]),
+            asyncio.to_thread(
+                mem_store.get_facts, author_id, 5)
+            if (MEMORY_FACTS_ENABLED and author_id) else asyncio.sleep(0, result=[]),
+        )
+    except Exception:
+        log.exception("memory recall failed")
+        return ""
+
+    blocks = []
+    if summaries:
+        s_lines = "\n".join(f"- {s['summary'][:600]}" for s in summaries)
+        blocks.append(f"\nOlder conversation summary:\n{s_lines}\n")
+    if recalled:
+        r_lines = "\n".join(
+            f"- {r.get('author_name', '?')}: {(r.get('content') or '')[:300]}"
+            for r in recalled
+        )
+        blocks.append(f"\nRelevant past messages:\n{r_lines}\n")
+    if facts:
+        f_lines = "\n".join(f"- {f['fact']}" for f in facts)
+        blocks.append(f"\nKnown about this user:\n{f_lines}\n")
+    return "".join(blocks)
+
+
+async def build_prompt(channel_id, user_message, username, author_id=""):
+    # Retrieval, web search and long-term memory are independent.
+    examples, web_block, memory_block = await asyncio.gather(
         asyncio.to_thread(retrieve_examples, channel_id, user_message),
         get_web_context(channel_id, user_message),
+        get_memory_context(channel_id, user_message, author_id),
     )
 
-    prompt = (
-        f"\n{MASTER_PROMPT}\n\n"
-        "STYLE PROFILE:\n"
-        "- Casual Discord language\n"
-        "- Short responses\n"
-        "- Slang-heavy\n\n"
-    )
+    prompt = f"\n{MASTER_PROMPT}\n\n"
+
+    style_block = ""
+    if STYLE_PROFILE_TEXT:
+        # Corpus-derived profile replaces the generic hardcoded lines below.
+        style_block = (
+            "\nStyle summary:\n"
+            + STYLE_PROFILE_TEXT[:STYLE_PROFILE_MAX_CHARS] + "\n"
+        )
+        prompt += style_block
+    else:
+        # Fallback until style_profile.txt is generated (see style_profile.py).
+        prompt += (
+            "STYLE PROFILE:\n"
+            "- Casual Discord language\n"
+            "- Short responses\n"
+            "- Slang-heavy\n\n"
+        )
 
     if examples:
-        prompt += "\nExamples:\n" + "".join(f"- {ex}\n" for ex in examples)
+        fitted = await asyncio.to_thread(
+            mem_examples.fit_examples, examples, EXAMPLES_MAX_TOKENS)
+        examples_block = "\nExamples:\n" + "".join(f"- {ex}\n" for ex in fitted)
+        prompt += examples_block
+    else:
+        examples_block = ""
+        fitted = []
+
+    if memory_block:
+        prompt += memory_block
 
     if web_block:
         prompt += web_block
 
     prompt += "\nConversation:\n"
 
-    # lookup table for reply context
-    msg_map = {m["id"]: m for m in conversation_history[channel_id]}
+    history = _history_compat(channel_id)
 
-    for m in conversation_history[channel_id]:
+    # lookup table for reply context
+    msg_map = {m["id"]: m for m in history}
+
+    for m in history:
 
         text = f"{m['author']}: {m['content']}"
 
@@ -502,6 +692,12 @@ async def build_prompt(channel_id, user_message, username):
         prompt += text + "\n"
 
     prompt += f"\nPrompt:\n{username}: {user_message}\n{ASSISTANT_NAME}:"
+
+    log.debug(
+        "[prompt] sections chars: style=%d examples=%d/%d memory=%d web=%d total=%d",
+        len(style_block), len(examples_block), len(fitted), len(memory_block),
+        len(web_block), len(prompt),
+    )
 
     return prompt
 
@@ -520,12 +716,13 @@ def strip_thinking(text):
     return text.strip()
 
 
-def is_ollama_model_loaded():
+def is_ollama_model_loaded(model_name=None):
+    target = model_name or OLLAMA_MODEL
     try:
         r = http.get(f"{OLLAMA_BASE}/api/ps", timeout=2)
         r.raise_for_status()
         return any(
-            m["name"].startswith(OLLAMA_MODEL)
+            m["name"].startswith(target)
             for m in r.json().get("models", [])
         )
     except Exception:
@@ -544,33 +741,50 @@ def is_embed_model_available():
         return False
 
 
-async def ollama_chat(messages):
+async def ollama_chat(messages, model=None, temperature=0.9,
+                      num_ctx=None, timeout=None, purpose="chat"):
+    resolved_model = model or OLLAMA_MODEL
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": resolved_model,
         "messages": messages,
         "options": {
-            "temperature": 0.9,
+            "temperature": temperature,
             "top_p": 0.95,
-            "num_ctx": MAX_OLLAMA_TOKENS,
+            "num_ctx": num_ctx if num_ctx is not None else MAX_OLLAMA_TOKENS,
         },
         "think": False,
         "stream": False,
         "keep_alive": "30m",
     }
 
+    t0 = time.time()
     try:
         r = await asyncio.to_thread(
             http.post,
             OLLAMA_URL,
             json=payload,
-            timeout=OLLAMA_TIMEOUT,
+            timeout=timeout if timeout is not None else OLLAMA_TIMEOUT,
         )
+        latency_ms = int((time.time() - t0) * 1000)
+
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+
+        mem_llmlog.log_call("ollama", resolved_model, purpose, payload, body,
+                     latency_ms, "ok" if r.status_code == 200 else "http-error")
 
         if r.status_code == 200:
-            return strip_thinking(r.json()["message"]["content"])
+            return strip_thinking(body["message"]["content"])
+
+        log.warning("Ollama HTTP %s", r.status_code)
 
     except Exception as e:
-        print("Ollama failed:", e)
+        latency_ms = int((time.time() - t0) * 1000)
+        log.warning("Ollama failed: %s", e)
+        mem_llmlog.log_call("ollama", resolved_model, purpose, payload,
+                            {"error": str(e)}, latency_ms, "error")
 
     return None
 
@@ -585,32 +799,44 @@ def _retry_delay(attempt, retry_after=None):
     return (1.5 ** attempt) + random.uniform(0, 1)
 
 
-async def openrouter_chat(messages, model, tag_as_fallback=False):
+async def openrouter_chat(messages, model, tag_as_fallback=False,
+                          temperature=0.9, max_tokens=None,
+                          timeout=None, max_retries=None, purpose="chat"):
     """
     One OpenRouter request with retries.
     Returns the reply text, or None so the caller can fall back.
+    Every attempt is dumped in full to llm.jsonl (never headers).
     """
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": 0.9,
+        "temperature": temperature,
         "top_p": 0.95,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    retries = MAX_RETRIES if max_retries is None else max_retries
+    req_timeout = REQUEST_TIMEOUT if timeout is None else timeout
 
+    for attempt in range(1, retries + 1):
+
+        t0 = time.time()
         try:
             r = await asyncio.to_thread(
                 http.post,
                 OPENROUTER_URL,
                 headers=OPENROUTER_HEADERS,
                 json=payload,
-                timeout=REQUEST_TIMEOUT,
+                timeout=req_timeout,
             )
         except Exception as e:
-            print(f"[{model}] Request failed: {e}")
+            log.warning("[%s] Request failed: %s", model, e)
+            mem_llmlog.log_call("openrouter", model, purpose, payload,
+                                {"error": str(e), "attempt": attempt},
+                         int((time.time() - t0) * 1000), "transport-error")
 
-            if attempt < MAX_RETRIES:
+            if attempt < retries:
                 await asyncio.sleep(_retry_delay(attempt))
 
             continue
@@ -618,8 +844,12 @@ async def openrouter_chat(messages, model, tag_as_fallback=False):
         try:
             data = r.json()
 
-            print(f"[{model}] OpenRouter response:")
-            print(json.dumps(data, indent=2, ensure_ascii=False))
+            log.debug("[%s] OpenRouter full response dumped to llm.jsonl "
+                      "(attempt %d)", model, attempt)
+            mem_llmlog.log_call("openrouter", model, purpose, payload, data,
+                         int((time.time() - t0) * 1000),
+                         "ok" if r.status_code == 200 else "http-error",
+                         )
 
         except Exception:
             data = {}
@@ -631,14 +861,15 @@ async def openrouter_chat(messages, model, tag_as_fallback=False):
             code = error.get("code")
             message = error.get("message", "")
 
-            print(f"[{model}] Embedded OpenRouter error ({code}): {message}")
+            log.warning("[%s] Embedded OpenRouter error (%s): %s",
+                        model, code, message)
 
             # Treat temporary upstream failures as retryable.
-            if code in RETRYABLE_CODES and attempt < MAX_RETRIES:
+            if code in RETRYABLE_CODES and attempt < retries:
                 delay = _retry_delay(attempt)
-                print(
-                    f"[{model}] Temporary error {code} → "
-                    f"retry {attempt}/{MAX_RETRIES} in {delay:.2f}s"
+                log.warning(
+                    "[%s] Temporary error %s → retry %d/%d in %.2fs",
+                    model, code, attempt, retries, delay,
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -650,13 +881,13 @@ async def openrouter_chat(messages, model, tag_as_fallback=False):
             try:
                 reply = data["choices"][0]["message"]["content"].strip()
             except (KeyError, IndexError, AttributeError):
-                print(f"[{model}] Unexpected response shape.")
+                log.warning("[%s] Unexpected response shape.", model)
                 return None
 
             if tag_as_fallback:
                 reply = f"-# [fallback: {model}]\n{reply}"
 
-            print(f"[{model}] Request succeeded.")
+            log.info("[%s] Request succeeded.", model)
             return reply
 
         if r.status_code in RETRYABLE_CODES:
@@ -664,48 +895,85 @@ async def openrouter_chat(messages, model, tag_as_fallback=False):
 
             # Don't retry if the daily free quota is exhausted
             if "free-models-per-day" in message:
-                print(f"[{model}] Daily free quota exhausted.")
+                log.warning("[%s] Daily free quota exhausted.", model)
                 return None
 
-            if attempt < MAX_RETRIES:
+            if attempt < retries:
                 delay = _retry_delay(attempt, r.headers.get("Retry-After"))
-                print(
-                    f"[{model}] HTTP {r.status_code} → "
-                    f"retry {attempt}/{MAX_RETRIES} in {delay:.2f}s"
+                log.warning(
+                    "[%s] HTTP %s → retry %d/%d in %.2fs",
+                    model, r.status_code, attempt, retries, delay,
                 )
                 await asyncio.sleep(delay)
                 continue
 
         else:
-            print(f"[{model}] Non-retryable HTTP error: {r.status_code}")
-            print(r.text[:500])
+            log.warning("[%s] Non-retryable HTTP error: %s", model, r.status_code)
+            log.debug("%s", r.text[:500])
             return None
 
-    print(f"[{model}] Retries exhausted.")
+    global _openrouter_failures
+    log.warning("[%s] Retries exhausted.", model)
+    _openrouter_failures += 1
     return None
 
 
-async def generate_reply(messages):
+async def generate_reply(messages, purpose="chat"):
     """
     Fallback chain: local Ollama → OpenRouter primary → OpenRouter fallback.
     Returns the reply text, or None if everything failed.
     """
     if await asyncio.to_thread(is_ollama_model_loaded):
-        print("[generate] Using loaded Ollama model")
+        log.info("[generate] Using loaded Ollama model")
 
-        reply = await ollama_chat(messages)
+        reply = await ollama_chat(messages, purpose=purpose)
         if reply:
             return reply
 
-    print(f"[generate] Using OpenRouter ({MODEL})")
+    log.info("[generate] Using OpenRouter (%s)", MODEL)
 
-    reply = await openrouter_chat(messages, MODEL)
+    reply = await openrouter_chat(messages, MODEL, purpose=purpose)
     if reply:
         return reply
 
-    print(f"[generate] Using OpenRouter fallback ({FALLBACK_MODEL})")
+    log.info("[generate] Using OpenRouter fallback (%s)", FALLBACK_MODEL)
 
-    return await openrouter_chat(messages, FALLBACK_MODEL, tag_as_fallback=True)
+    return await openrouter_chat(messages, FALLBACK_MODEL,
+                                 tag_as_fallback=True, purpose=purpose)
+
+
+async def summary_generate(messages, purpose="summary"):
+    """Background-job chain: local summary Ollama model → OpenRouter summary model.
+
+    Never touches the main live-chat models. Fail-soft: returns None so
+    the caller skips this cycle instead of burning quota on retries.
+    """
+    if await asyncio.to_thread(is_ollama_model_loaded, SUMMARY_OLLAMA_MODEL):
+        log.info("[summary] Using local Ollama model (%s)", SUMMARY_OLLAMA_MODEL)
+
+        reply = await ollama_chat(
+            messages,
+            model=SUMMARY_OLLAMA_MODEL,
+            temperature=SUMMARY_TEMPERATURE,
+            num_ctx=SUMMARY_OLLAMA_CTX,
+            timeout=SUMMARY_OLLAMA_TIMEOUT,
+            purpose=purpose,
+        )
+        if reply:
+            return reply
+
+    log.info("[summary] Using OpenRouter summary model (%s)",
+             SUMMARY_MODEL)
+
+    return await openrouter_chat(
+        messages,
+        SUMMARY_MODEL,
+        temperature=SUMMARY_TEMPERATURE,
+        max_tokens=SUMMARY_MAX_TOKENS,
+        timeout=SUMMARY_TIMEOUT,
+        max_retries=SUMMARY_MAX_RETRIES,
+        purpose=purpose,
+    )
 
 # ============================================================
 # PROMPT COMMAND
@@ -779,7 +1047,7 @@ def cleanup_prompt_conversations():
         del prompt_conversations[conversation_id]
 
     if expired:
-        print(f"[prompt] Removed {len(expired)} expired conversation(s).")
+        log.info("[prompt] Removed %d expired conversation(s).", len(expired))
 
 
 async def prompt_cleanup_loop():
@@ -852,7 +1120,7 @@ class ContinuePromptModal(discord.ui.Modal):
             prompt = user_message
 
             if self.web_enabled:
-                print(f"[prompt] Continue web search: {user_message!r}")
+                log.info("[prompt] Continue web search: %r", user_message)
 
                 web_results = await asyncio.to_thread(web_search, user_message)
                 prompt = build_web_prompt(user_message, web_results)
@@ -863,7 +1131,11 @@ class ContinuePromptModal(discord.ui.Modal):
             })
             conversation["web_results"] = web_results
 
-            reply = await generate_reply(conversation["messages"])
+            log.debug("PROMPT-CONTINUE SENT TO MODEL (%d msgs):\n%s\n[END PROMPT]",
+                        len(conversation["messages"]),
+                        json.dumps(conversation["messages"], ensure_ascii=False))
+            reply = await generate_reply(conversation["messages"],
+                                           purpose="prompt-continue")
 
             if reply is None:
                 reply = "All models are currently unavailable 💀"
@@ -878,7 +1150,7 @@ class ContinuePromptModal(discord.ui.Modal):
             await send_prompt_response(interaction, self.conversation_id)
 
         except Exception:
-            print("[prompt] Continue error:\n" + traceback.format_exc())
+            log.exception("[prompt] Continue error")
             await interaction.followup.send(
                 "Something went wrong while continuing the conversation."
             )
@@ -1105,6 +1377,147 @@ async def send_prompt_response(interaction, conversation_id):
     view.message = message
 
 # ============================================================
+# LONG-TERM MEMORY JOBS
+# ============================================================
+
+_last_fact_run = {}
+
+
+async def summarize_channel(channel_id):
+    """Summarize one chunk of unsummarized messages for a channel."""
+    chunk = await asyncio.to_thread(
+        mem_store.get_unsummarized, channel_id, MEMORY_SUMMARY_CHUNK)
+    if not chunk:
+        return False
+    try:
+        prompt = mem_summary.build_summary_prompt(chunk)
+        summary_text = await summary_generate([
+            {"role": "system", "content": mem_summary.SUMMARIZER_SYSTEM},
+            {"role": "user", "content": prompt},
+        ], purpose="summary")
+        if not summary_text:
+            return False
+        msg_ids = [m["msg_id"] for m in chunk]
+        await asyncio.to_thread(
+            mem_store.add_summary, channel_id, summary_text,
+            min(msg_ids), max(msg_ids))
+        await asyncio.to_thread(
+            mem_store.set_last_summary_upto, channel_id, max(msg_ids))
+        log.info("[memory] summarized %d msgs in channel %s",
+                 len(chunk), channel_id)
+        # Batched multi-speaker facts ride on the same chunk (fail-soft,
+        # never blocks the summary bookkeeping above).
+        await extract_chunk_facts(channel_id, chunk)
+        return True
+    except Exception:
+        log.exception("[memory] summarizer failed for %s", channel_id)
+        return False
+
+
+async def extract_chunk_facts(channel_id, chunk):
+    """Extract facts for ALL human speakers in a summarized chunk.
+
+    One summary-chain call per chunk. Shares the per-user debounce with
+    the live single-user path so neither double-bills a user.
+    """
+    if not MEMORY_FACTS_ENABLED:
+        return
+    speakers, ambiguous = mem_facts.resolve_speakers(chunk)
+    if ambiguous:
+        log.warning("[memory] ambiguous speaker names in %s: %s",
+                    channel_id, sorted(ambiguous))
+    if not speakers:
+        return
+    try:
+        prompt = mem_summary.build_multi_fact_prompt(chunk)
+        raw = await summary_generate([
+            {"role": "system", "content":
+             "You extract stable user facts as JSON. Return ONLY a JSON object."},
+            {"role": "user", "content": prompt},
+        ], purpose="facts")
+        parsed = mem_facts.parse_multi_facts_json(raw or "")
+        if not parsed:
+            return
+        now = time.time()
+        saved = 0
+        for name, facts in parsed.items():
+            uid = speakers.get(name.strip())
+            if not uid:
+                continue
+            if now - _last_fact_run.get(uid, 0) < 600:
+                continue
+            _last_fact_run[uid] = now
+            for fact in facts:
+                ok = await asyncio.to_thread(
+                    mem_store.upsert_fact, uid, fact, 1.0)
+                saved += 1 if ok else 0
+        log.info("[memory] chunk facts: %d saved for %d speaker(s) in %s",
+                 saved, len(parsed), channel_id)
+    except Exception:
+        log.exception("[memory] chunk fact extraction failed")
+
+
+async def memory_maintenance_loop():
+    """Periodically summarize channels seen recently. Fail-soft."""
+    await client.wait_until_ready()
+    seen = set()
+    while not client.is_closed():
+        try:
+            # discover channels from recent guilds to avoid unbounded growth
+            for guild in client.guilds:
+                for ch in guild.text_channels:
+                    # never compete with a live reply in the same channel
+                    lock = _channel_locks.get(ch.id)
+                    if lock is not None and lock.locked():
+                        continue
+                    # only touch channels with recent unsummarized backlog
+                    chunk = await asyncio.to_thread(
+                        mem_store.get_unsummarized, ch.id, MEMORY_SUMMARY_CHUNK)
+                    if chunk:
+                        await summarize_channel(ch.id)
+                        await asyncio.sleep(2)  # don't hammer the LLM
+            # also cover DM channels the bot has seen via cooldown map
+            for channel_id in list(seen):
+                await summarize_channel(channel_id)
+        except Exception:
+            log.exception("[memory] maintenance loop error")
+        await asyncio.sleep(SUMMARY_INTERVAL)
+
+
+def _track_channel(channel_id):
+    # hook for DM channels (no guild listing) so summarizer finds them
+    if not hasattr(_track_channel, "seen"):
+        _track_channel.seen = set()
+    _track_channel.seen.add(str(channel_id))
+
+
+async def maybe_extract_facts(channel_id, user_id, username):
+    """Debounced per-user fact extraction (max 1 run / 10 min / user)."""
+    if not MEMORY_FACTS_ENABLED or not user_id:
+        return
+    now = time.time()
+    if now - _last_fact_run.get(str(user_id), 0) < 600:
+        return
+    _last_fact_run[str(user_id)] = now
+    try:
+        recent = await asyncio.to_thread(
+            mem_store.get_recent, channel_id, 10)
+        if not recent:
+            return
+        prompt = mem_summary.build_fact_prompt(username, recent)
+        raw = await summary_generate([
+            {"role": "system", "content":
+             "You extract stable user facts as JSON. Return ONLY a JSON array."},
+            {"role": "user", "content": prompt},
+        ], purpose="facts")
+        for fact in mem_facts.parse_facts_json(raw or ""):
+            await asyncio.to_thread(
+                mem_store.upsert_fact, user_id, fact, 1.0)
+        log.info("[memory] fact extraction done for %s", username)
+    except Exception:
+        log.exception("[memory] fact extraction failed")
+
+# ============================================================
 # DISCORD
 # ============================================================
 
@@ -1150,10 +1563,13 @@ tree = discord.app_commands.CommandTree(client)
 async def clear_memory(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    conversation_history[interaction.channel_id].clear()
+    # Lobotomy = drop recent short-term buffer to unstick looping models.
+    # Summaries + user_facts are intentionally preserved.
+    removed = await asyncio.to_thread(
+        mem_store.clear_recent, interaction.channel_id, MAX_HISTORY)
 
     await interaction.followup.send(
-        CLEAR_COMMAND_TEXT,
+        f"{CLEAR_COMMAND_TEXT} ({removed} messages forgotten)",
         ephemeral=False,  # set True if you want only the user to see it
     )
 
@@ -1162,13 +1578,15 @@ async def clear_memory(interaction: discord.Interaction):
 async def status(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    ollama_loaded, embed_available = await asyncio.gather(
+    ollama_loaded, summary_loaded, embed_available, mem = await asyncio.gather(
         asyncio.to_thread(is_ollama_model_loaded),
+        asyncio.to_thread(is_ollama_model_loaded, SUMMARY_OLLAMA_MODEL),
         asyncio.to_thread(is_embed_model_available),
+        asyncio.to_thread(mem_store.stats, interaction.channel_id),
     )
+    mem_global = await asyncio.to_thread(mem_store.stats, None)
 
     image_count = len(list_images())
-    memory_count = len(conversation_history[interaction.channel_id])
     ping = round(client.latency * 1000)
 
     text = (
@@ -1186,7 +1604,13 @@ async def status(interaction: discord.Interaction):
         f"- {MODEL}\n\n"
 
         f"**OpenRouter fallback**\n"
-        f"- {FALLBACK_MODEL}\n\n"
+        f"- {FALLBACK_MODEL}\n"
+        f"- failures this session: {_openrouter_failures}\n\n"
+    
+        f"**Summarizer**\n"
+        f"- Ollama: {SUMMARY_OLLAMA_MODEL}\n"
+        f"- {'🟢 Loaded' if summary_loaded else '🔴 Not loaded'}\n"
+        f"- OpenRouter: {SUMMARY_MODEL}\n\n"
 
         f"**HNSW index**\n"
         f"- {'🟢 Loaded' if index is not None else '🔴 Missing'}\n"
@@ -1201,8 +1625,11 @@ async def status(interaction: discord.Interaction):
         f"**Random images**\n"
         f"- {image_count}\n\n"
 
-        f"**Conversation memory**\n"
-        f"- {memory_count}/{MAX_HISTORY}"
+        f"**Conversation memory (this channel)**\n"
+        f"- {mem['messages']} buffered\n"
+        f"- {mem['summaries']} summaries\n"
+        f"- {mem_global['facts']} user facts (global)\n"
+        f"- DB {mem_global['db_bytes'] // 1024} KB\n\n"
     )
 
     await interaction.followup.send(text)
@@ -1265,7 +1692,7 @@ async def prompt_command(
         web_results = []
 
         if web:
-            print(f"[prompt] Web search: {query!r}")
+            log.info("[prompt] Web search: %r", query)
 
             web_results = await asyncio.to_thread(web_search, query)
             prompt = build_web_prompt(query, web_results)
@@ -1289,7 +1716,10 @@ async def prompt_command(
         # GENERATE
         # ====================================================
 
-        reply = await generate_reply(messages)
+        log.debug("PROMPT-COMMAND SENT TO MODEL (%d msgs):\n%s\n[END PROMPT]",
+                    len(messages),
+                    json.dumps(messages, ensure_ascii=False))
+        reply = await generate_reply(messages, purpose="prompt")
 
         if reply is None:
             reply = "All models are currently unavailable 💀"
@@ -1323,7 +1753,7 @@ async def prompt_command(
         await send_prompt_response(interaction, conversation_id)
 
     except Exception:
-        print("[prompt] Unexpected error:\n" + traceback.format_exc())
+        log.exception("[prompt] Unexpected error")
         await interaction.followup.send(
             "Something went wrong while processing the prompt."
         )
@@ -1338,7 +1768,12 @@ async def on_ready():
             prompt_cleanup_loop()
         )
 
-    print(f"Logged in as {client.user}")
+    if not hasattr(client, "memory_task"):
+        client.memory_task = asyncio.create_task(
+            memory_maintenance_loop()
+        )
+
+    log.info("Logged in as %s", client.user)
 
 
 @client.event
@@ -1352,17 +1787,34 @@ async def on_message(message):
     if message.reference and message.reference.message_id:
         reply_to = message.reference.message_id
 
-    add_message(
+    _track_channel(message.channel.id)
+    await asyncio.to_thread(
+        add_message,
         message.channel.id,
         message.id,
         str(message.author),
         "user",
         message.content,
         reply_to,
+        str(message.author.id),
     )
 
     if client.user not in message.mentions:
         return
+
+    # ---- 5s per-user cooldown (reliability) ----
+    now = time.time()
+    last = _last_call.get(message.author.id, 0)
+    if now - last < COOLDOWN_SECONDS:
+        try:
+            await message.reply(
+                f"Slow down a little ({COOLDOWN_SECONDS}s cooldown) 💀",
+                delete_after=5,
+            )
+        except Exception:
+            pass
+        return
+    _last_call[message.author.id] = now
 
     cleaned = (
         message.content
@@ -1374,54 +1826,78 @@ async def on_message(message):
         await message.reply("Say something after pinging me.")
         return
 
-    try:
-        async with message.channel.typing():
-            prompt = await build_prompt(
-                message.channel.id,
-                cleaned,
-                str(message.author),
+    lock = _channel_locks[message.channel.id]
+    if lock.locked():
+        try:
+            await message.reply(
+                "I'm already thinking in this channel, one sec 💀",
+                delete_after=5,
             )
+        except Exception:
+            pass
+        return
 
-            print("\n" + "=" * 80)
-            print("PROMPT SENT TO MODEL")
-            print("=" * 80)
-            print(prompt)
-            print("=" * 80 + "\n")
+    async with lock:
+        try:
+            async with message.channel.typing():
+                prompt = await build_prompt(
+                    message.channel.id,
+                    cleaned,
+                    str(message.author),
+                    str(message.author.id),
+                )
 
-            messages = [
-                {
-                    "role": "system",
-                    "content": MASTER_PROMPT,
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ]
+                log.debug("PROMPT SENT TO MODEL (%d chars):\n%s\n[END PROMPT]",
+                            len(prompt), prompt)
 
-            reply = await generate_reply(messages)
+                messages = [
+                    {
+                        "role": "system",
+                        "content": MASTER_PROMPT,
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ]
 
-            # FINAL SAFETY NET
-            if reply is None:
-                reply = "All models are currently unavailable 💀"
+                reply = await generate_reply(messages)
 
-            if len(reply) > 1900:
-                reply = reply[:1900] + "..."
+                # FINAL SAFETY NET
+                if reply is None:
+                    reply = "All models are currently unavailable 💀"
 
-            sent = await message.reply(reply)
+                if len(reply) > 1900:
+                    reply = reply[:1900] + "..."
 
-            add_message(
-                message.channel.id,
-                sent.id,
-                ASSISTANT_NAME,
-                "assistant",
-                reply,
-                reply_to=message.id,
-            )
+                sent = await message.reply(reply)
 
-    except Exception:
-        tb = traceback.format_exc()
-        await message.reply(f"Error:\n```{tb[-1500:]}```")
+                await asyncio.to_thread(
+                    add_message,
+                    message.channel.id,
+                    sent.id,
+                    ASSISTANT_NAME,
+                    "assistant",
+                    reply,
+                    message.id,
+                    str(client.user.id) if client.user else "assistant",
+                )
+
+                # fire-and-forget long-term learning (never blocks reply)
+                asyncio.create_task(
+                    maybe_extract_facts(
+                        message.channel.id,
+                        str(message.author.id),
+                        str(message.author),
+                    )
+                )
+
+        except Exception:
+            log.exception("on_message failed")
+            try:
+                await message.reply("Something broke on my side 💀")
+            except Exception:
+                pass
 
 
 client.run(DISCORD_TOKEN)
