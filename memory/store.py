@@ -304,7 +304,7 @@ def search_summaries(channel_id, query, limit=2):
     try:
         rows = con.execute(
             "SELECT chunk_id, summary, msg_from, msg_to, created_at"
-            " FROM summaries WHERE channel_id=? ORDER BY chunk_id DESC LIMIT 50",
+            " FROM summaries WHERE channel_id=? ORDER BY chunk_id DESC LIMIT 200",
             (str(channel_id),),
         ).fetchall()
     finally:
