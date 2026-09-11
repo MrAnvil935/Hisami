@@ -21,6 +21,7 @@ from memory import recall as mem_recall
 from memory import store as mem_store
 from memory import styleprofile as mem_styleprofile
 from memory import summary as mem_summary
+from memory import vision as mem_vision
 
 
 class TempDBMixin:
@@ -75,6 +76,18 @@ class StoreTest(TempDBMixin, unittest.TestCase):
         self.assertEqual(mem_store.get_message_count("c1"), 6)
         self.assertEqual(len(mem_store.get_latest_summaries("c1")), 1)
         self.assertEqual(len(mem_store.get_facts("u1")), 1)
+
+    def test_get_facts_query_ranking(self):
+        mem_store.upsert_fact("uq", "plays minecraft daily")
+        mem_store.upsert_fact("uq", "likes hiking")
+        mem_store.upsert_fact("uq", "owns a farm")
+        # legacy path (no query): recency order
+        legacy = [f["fact"] for f in mem_store.get_facts("uq", 3)]
+        self.assertEqual(legacy[0], "owns a farm")
+        # query path: topical old fact wins despite recency
+        ranked = [f["fact"]
+                  for f in mem_store.get_facts("uq", 3, query="minecraft?")]
+        self.assertEqual(ranked[0], "plays minecraft daily")
 
     def test_summary_chunking(self):
         self._seed(n=39)
@@ -132,6 +145,20 @@ class RecallTest(TempDBMixin, unittest.TestCase):
         hits = mem_recall.search_messages("c1", "skyblock minecraft server")
         self.assertTrue(hits)
         self.assertIn("skyblock", hits[0]["content"])
+
+    def test_rank_by_overlap(self):
+        items = [
+            {"fact": "likes hiking", "updated_at": 30},
+            {"fact": "plays minecraft daily", "updated_at": 10},
+            {"fact": "owns a farm", "updated_at": 20},
+        ]
+        ranked = mem_recall.rank_by_overlap(items, "minecraft server?")
+        self.assertEqual(ranked[0]["fact"], "plays minecraft daily")
+        # no overlap -> pure recency, legacy order preserved
+        ranked = mem_recall.rank_by_overlap(items, "zzz qqq")
+        self.assertEqual([r["fact"] for r in ranked],
+                         ["likes hiking", "owns a farm", "plays minecraft daily"])
+        self.assertEqual(mem_recall.rank_by_overlap(items, ""), ranked)
 
     def test_referenced_users_mention(self):
         msgs = [
@@ -401,6 +428,81 @@ class StyleProfileTest(unittest.TestCase):
         msgs = style_profile.build_messages(["xd"])
         self.assertEqual([m["role"] for m in msgs], ["system", "user"])
         self.assertIn("xd", msgs[1]["content"])
+
+
+class VisionTest(unittest.TestCase):
+    def test_extract_image_urls(self):
+        text = ("look https://x.com/a.png, and http://y.org/b.JPG?w=1 "
+                "not this https://z.net/page.html (see pic.")
+        self.assertEqual(mem_vision.extract_image_urls(text),
+                         ["https://x.com/a.png", "http://y.org/b.JPG?w=1"])
+        self.assertEqual(mem_vision.extract_image_urls("no links"), [])
+        self.assertEqual(mem_vision.extract_image_urls(""), [])
+
+    def test_classify_attachments(self):
+        from types import SimpleNamespace as NS
+        atts = [
+            NS(content_type="image/png", filename="a.png",
+               url="https://cdn/x/a.png"),
+            NS(content_type="video/mp4", filename="b.mp4",
+               url="https://cdn/x/b.mp4"),
+            NS(content_type="application/pdf", filename="c.pdf",
+               url="https://cdn/x/c.pdf"),
+            NS(content_type="", filename="d.jpg", url="https://cdn/x/d.jpg"),
+            NS(content_type="image/png", filename="e.png", url=""),
+        ]
+        out = mem_vision.classify_attachments(atts)
+        self.assertEqual(
+            [(a["kind"], a["name"]) for a in out],
+            [("image", "a.png"), ("video", "b.mp4"), ("image", "d.jpg")])
+
+    def test_downscale(self):
+        from PIL import Image
+        import io as _io
+        img = Image.new("RGB", (2000, 100), "red")
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        small = mem_vision.downscale(buf.getvalue())
+        out = Image.open(_io.BytesIO(small))
+        self.assertEqual(out.format, "JPEG")
+        self.assertLessEqual(max(out.size), 512)
+        self.assertGreater(max(out.size), 0)
+
+    def test_cache_key_stable(self):
+        self.assertEqual(mem_vision.cache_key("https://x/a.png"),
+                         mem_vision.cache_key("https://x/a.png"))
+        self.assertNotEqual(mem_vision.cache_key("https://x/a.png"),
+                            mem_vision.cache_key("https://x/b.png"))
+
+    def test_format_markers(self):
+        self.assertEqual(
+            mem_vision.format_markers(
+                [{"kind": "image", "name": "a.png"},
+                 {"kind": "video", "name": "b.mp4"}]),
+            " [image: a.png] [video: b.mp4]")
+        self.assertEqual(mem_vision.format_markers([]), "")
+        self.assertEqual(mem_vision.format_markers(None), "")
+
+
+class VisionStoreTest(TempDBMixin, unittest.TestCase):
+    def test_attachments_roundtrip(self):
+        mem_store.add_message(
+            "cv", 1, "u1", "alice", "user", "look",
+            attachments=[{"kind": "image", "name": "a.png",
+                          "url": "https://x/a.png"},
+                         {"kind": "other", "name": "x.zip"}])
+        rows = mem_store.get_recent("cv", 5)
+        # only image/video kinds persist
+        self.assertEqual(rows[0]["attachments"],
+                         [{"kind": "image", "name": "a.png"}])
+
+    def test_image_cache(self):
+        self.assertEqual(mem_store.get_image_desc("k1"), "")
+        mem_store.set_image_desc("k1", "a cat", max_rows=200)
+        self.assertEqual(
+            mem_store.get_image_desc("k1", ttl_seconds=60), "a cat")
+        self.assertEqual(
+            mem_store.get_image_desc("k1", ttl_seconds=-1), "")
 
 
 if __name__ == "__main__":

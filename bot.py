@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import json
 import logging
@@ -25,6 +26,7 @@ from memory import llmlog as mem_llmlog
 from memory import recall as mem_recall
 from memory import store as mem_store
 from memory import summary as mem_summary
+from memory import vision as mem_vision
 
 # Console (terminal) stays concise at INFO. Full bodies go to the
 # rotating file log + llm.jsonl, wired up after config load below.
@@ -98,6 +100,18 @@ SUMMARY_TIMEOUT = config.get("summary_timeout", 60)
 SUMMARY_MAX_RETRIES = config.get("summary_max_retries", 1)
 SUMMARY_INTERVAL = config.get("summary_interval", 300)
 SUMMARY_OLLAMA_CTX = config.get("summary_ollama_ctx", 2048)
+
+# ---- vision chain: separate models, local-first like summaries ----
+# User tunes both model names via config. Only the FIRST image found is
+# ever described (own upload, link in text, or replied-to message).
+VISION_OLLAMA_MODEL = config.get("vision_ollama_model", "qwen2.5vl:3b")
+VISION_MODEL = config.get("vision_model", "openrouter/free")
+VISION_TEMPERATURE = config.get("vision_temperature", 0.2)
+VISION_MAX_TOKENS = config.get("vision_max_tokens", 300)
+VISION_TIMEOUT = config.get("vision_timeout", 90)
+VISION_MAX_BYTES = config.get("vision_max_bytes", 10 * 1024 * 1024)
+VISION_CACHE_TTL = config.get("vision_cache_ttl_days", 7) * 86400
+VISION_CACHE_MAX = config.get("vision_cache_max", 200)
 
 # ---- static style profile (hand-reviewed persona blurb) ----
 STYLE_PROFILE_PATH = config.get("style_profile_path", "style_profile.txt")
@@ -248,17 +262,30 @@ def _history_compat(channel_id):
             "role": r.get("role", "user"),
             "content": r.get("content", ""),
             "reply_to": r.get("reply_to"),
+            "attachments": r.get("attachments") or [],
         }
         for r in rows
     ]
 
 
 def add_message(channel_id, message_id, author, role, content, reply_to=None,
-                author_id=""):
-    mem_store.add_message(
-        channel_id, message_id, author_id, author,
-        role, content, reply_to,
-    )
+                author_id="", attachments=None):
+    try:
+        mem_store.add_message(
+            channel_id, message_id, author_id, author,
+            role, content, reply_to,
+            attachments=attachments,
+        )
+    except TypeError:
+        # Stale memory/store.py without the attachments parameter
+        # (partial deploy) — store the message without media metadata
+        # rather than dropping it entirely.
+        log.warning("add_message attachments unsupported, "
+                    "memory/store.py is outdated — sync it")
+        mem_store.add_message(
+            channel_id, message_id, author_id, author,
+            role, content, reply_to,
+        )
     # prune runs inside to_thread callers; keep it cheap: prune async occasionally
     try:
         if mem_store.get_message_count(channel_id) > MEMORY_PRUNE_KEEP + 20:
@@ -607,7 +634,7 @@ async def get_memory_context(channel_id, user_message, author_id=""):
                 MEMORY_RECALL_LIMIT) if MEMORY_RECALL_ENABLED
             else asyncio.sleep(0, result=[]),
             asyncio.to_thread(
-                mem_store.get_facts, author_id, 5)
+                mem_store.get_facts, author_id, 5, user_message)
             if (MEMORY_FACTS_ENABLED and author_id) else asyncio.sleep(0, result=[]),
             asyncio.to_thread(
                 mem_store.get_recent, channel_id, 15)
@@ -641,7 +668,8 @@ async def get_memory_context(channel_id, user_message, author_id=""):
             if peer_ids:
                 peer_facts = await asyncio.gather(*[
                     asyncio.to_thread(
-                        mem_store.get_facts, uid, MEMORY_PEER_MAX_FACTS)
+                        mem_store.get_facts, uid, MEMORY_PEER_MAX_FACTS,
+                        user_message)
                     for uid in peer_ids
                 ])
                 for uid, pf in zip(peer_ids, peer_facts):
@@ -655,7 +683,8 @@ async def get_memory_context(channel_id, user_message, author_id=""):
     return "".join(blocks)
 
 
-async def build_prompt(channel_id, user_message, username, author_id=""):
+async def build_prompt(channel_id, user_message, username, author_id="",
+                       image_block=""):
     # Retrieval, web search and long-term memory are independent.
     examples, web_block, memory_block = await asyncio.gather(
         asyncio.to_thread(retrieve_examples, channel_id, user_message),
@@ -697,6 +726,9 @@ async def build_prompt(channel_id, user_message, username, author_id=""):
     if web_block:
         prompt += web_block
 
+    if image_block:
+        prompt += image_block
+
     prompt += "\nConversation:\n"
 
     history = _history_compat(channel_id)
@@ -707,6 +739,10 @@ async def build_prompt(channel_id, user_message, username, author_id=""):
     for m in history:
 
         text = f"{m['author']}: {m['content']}"
+
+        markers = mem_vision.format_markers(m.get("attachments"))
+        if markers:
+            text += markers
 
         if m.get("reply_to"):
             parent = msg_map.get(m["reply_to"])
@@ -723,9 +759,9 @@ async def build_prompt(channel_id, user_message, username, author_id=""):
     prompt += f"\nPrompt:\n{username}: {user_message}\n{ASSISTANT_NAME}:"
 
     log.debug(
-        "[prompt] sections chars: style=%d examples=%d/%d memory=%d web=%d total=%d",
+        "[prompt] sections chars: style=%d examples=%d/%d memory=%d web=%d image=%d total=%d",
         len(style_block), len(examples_block), len(fitted), len(memory_block),
-        len(web_block), len(prompt),
+        len(web_block), len(image_block), len(prompt),
     )
 
     return prompt
@@ -1003,6 +1039,203 @@ async def summary_generate(messages, purpose="summary"):
         max_retries=SUMMARY_MAX_RETRIES,
         purpose=purpose,
     )
+
+# ============================================================
+# VISION (image understanding, separate models)
+# ============================================================
+
+VISION_QUESTION = (
+    "Describe this image briefly and factually in 2-4 sentences: "
+    "what is shown, any visible text, and anything notable. No roleplay."
+)
+
+
+def _vision_log_payload(payload):
+    """Redacted copy for llm.jsonl: raw image bytes become placeholders."""
+    try:
+        red = json.loads(json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        return {"redacted": True}
+    if isinstance(red, dict) and red.get("images"):
+        red["images"] = [f"[image {len(str(b))} chars b64]" for b in red["images"]]
+    for m in (red.get("messages") or []):
+        content = m.get("content")
+        if isinstance(content, list):
+            for part in content:
+                url = (part.get("image_url") or {}).get("url", "")
+                if isinstance(url, str) and url.startswith("data:"):
+                    part["image_url"]["url"] = (
+                        f"[image {len(url)} chars data-url]")
+    return red
+
+
+def download_image(url):
+    """Blocking: fetch raw bytes if the URL serves an image. Else None."""
+    try:
+        r = http.get(url, timeout=30)
+        if r.status_code != 200 or not r.content:
+            return None
+        if not r.headers.get("Content-Type", "").startswith("image/"):
+            return None
+        if len(r.content) > VISION_MAX_BYTES:
+            log.warning("[vision] image over size cap, skipping")
+            return None
+        return r.content
+    except Exception:
+        return None
+
+
+async def vision_generate(image_b64, question):
+    """Describe an image: local vision model → OpenRouter vision model.
+
+    Never touches the main chat models. Fail-soft: returns '' so the
+    reply goes out without image context instead of erroring.
+    """
+    if await asyncio.to_thread(is_ollama_model_loaded, VISION_OLLAMA_MODEL):
+        log.info("[vision] Using local Ollama model (%s)", VISION_OLLAMA_MODEL)
+
+        payload = {
+            "model": VISION_OLLAMA_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": question,
+                "images": [image_b64],
+            }],
+            "options": {"temperature": VISION_TEMPERATURE},
+            "stream": False,
+            "keep_alive": "30m",
+        }
+        t0 = time.time()
+        try:
+            r = await asyncio.to_thread(
+                http.post, OLLAMA_URL, json=payload, timeout=VISION_TIMEOUT)
+            latency_ms = int((time.time() - t0) * 1000)
+            try:
+                body = r.json()
+            except Exception:
+                body = {"raw": r.text}
+            mem_llmlog.log_call("ollama", VISION_OLLAMA_MODEL, "vision",
+                                _vision_log_payload(payload), body,
+                                latency_ms,
+                                "ok" if r.status_code == 200 else "http-error")
+            if r.status_code == 200:
+                return strip_thinking(body["message"]["content"])
+            log.warning("Ollama vision HTTP %s", r.status_code)
+        except Exception as e:
+            latency_ms = int((time.time() - t0) * 1000)
+            log.warning("Ollama vision failed: %s", e)
+            mem_llmlog.log_call("ollama", VISION_OLLAMA_MODEL, "vision",
+                                _vision_log_payload(payload),
+                                {"error": str(e)}, latency_ms, "error")
+
+    log.info("[vision] Using OpenRouter vision model (%s)",
+             VISION_MODEL)
+
+    payload = {
+        "model": VISION_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{image_b64}"}},
+            ],
+        }],
+        "temperature": VISION_TEMPERATURE,
+        "max_tokens": VISION_MAX_TOKENS,
+    }
+    t0 = time.time()
+    try:
+        r = await asyncio.to_thread(
+            http.post, OPENROUTER_URL, headers=OPENROUTER_HEADERS,
+            json=payload, timeout=VISION_TIMEOUT)
+        latency_ms = int((time.time() - t0) * 1000)
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+        mem_llmlog.log_call("openrouter", VISION_MODEL, "vision",
+                            _vision_log_payload(payload), data, latency_ms,
+                            "ok" if r.status_code == 200 else "http-error")
+        if r.status_code == 200:
+            return data["choices"][0]["message"]["content"].strip()
+        log.warning("[vision] OpenRouter HTTP %s", r.status_code)
+    except Exception as e:
+        latency_ms = int((time.time() - t0) * 1000)
+        log.warning("[vision] OpenRouter failed: %s", e)
+        mem_llmlog.log_call("openrouter", VISION_MODEL, "vision",
+                            _vision_log_payload(payload),
+                            {"error": str(e)}, latency_ms, "error")
+
+    return ""
+
+
+async def resolve_prompt_image(message):
+    """Find the FIRST image for a ping, or (None, None).
+
+    Order: own uploads → links in own text → replied-to message's
+    uploads/links. Videos are never returned here (annotation only).
+    """
+    atts = mem_vision.classify_attachments(getattr(message, "attachments", []))
+    for a in atts:
+        if a["kind"] == "image":
+            return mem_vision.cache_key(a["url"]), a["url"]
+
+    for url in mem_vision.extract_image_urls(getattr(message, "content", "")):
+        return mem_vision.cache_key(url), url
+
+    ref = getattr(message, "reference", None)
+    target = getattr(ref, "resolved", None) if ref else None
+    if target is None and ref and getattr(ref, "message_id", None):
+        try:
+            target = await message.channel.fetch_message(ref.message_id)
+        except Exception:
+            target = None
+
+    if target is not None:
+        atts = mem_vision.classify_attachments(
+            getattr(target, "attachments", []))
+        for a in atts:
+            if a["kind"] == "image":
+                return mem_vision.cache_key(a["url"]), a["url"]
+        for url in mem_vision.extract_image_urls(
+                getattr(target, "content", "")):
+            return mem_vision.cache_key(url), url
+
+    return None, None
+
+
+async def describe_image(source_key, image_url, question=VISION_QUESTION):
+    """Return (description, cached). Downloads, downscales, describes."""
+    get_desc = getattr(mem_store, "get_image_desc", None)
+    set_desc = getattr(mem_store, "set_image_desc", None)
+
+    cached = ""
+    if get_desc is not None:
+        cached = await asyncio.to_thread(
+            get_desc, source_key, VISION_CACHE_TTL)
+    if cached:
+        log.info("[vision] cache hit, skipping model call")
+        return cached, True
+
+    raw = await asyncio.to_thread(download_image, image_url)
+    if not raw:
+        return "", False
+
+    try:
+        small = await asyncio.to_thread(mem_vision.downscale, raw)
+    except Exception:
+        log.warning("[vision] undecodable image, skipping")
+        return "", False
+
+    image_b64 = base64.b64encode(small).decode("ascii")
+    desc = await vision_generate(image_b64, question)
+
+    if desc and set_desc is not None:
+        await asyncio.to_thread(
+            set_desc, source_key, desc, VISION_CACHE_MAX)
+
+    return desc or "", False
 
 # ============================================================
 # PROMPT COMMAND
@@ -1451,7 +1684,12 @@ async def extract_chunk_facts(channel_id, chunk):
     """
     if not MEMORY_FACTS_ENABLED:
         return
-    speakers, ambiguous = mem_facts.resolve_speakers(chunk)
+    resolver = getattr(mem_facts, "resolve_speakers", None)
+    if resolver is None:
+        log.warning("[memory] chunk facts skipped: memory/facts.py "
+                    "is outdated — sync it")
+        return
+    speakers, ambiguous = resolver(chunk)
     if ambiguous:
         log.warning("[memory] ambiguous speaker names in %s: %s",
                     channel_id, sorted(ambiguous))
@@ -1581,9 +1819,10 @@ async def clear_memory(interaction: discord.Interaction):
 async def status(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    ollama_loaded, summary_loaded, embed_available, mem = await asyncio.gather(
+    ollama_loaded, summary_loaded, vision_loaded, embed_available, mem = await asyncio.gather(
         asyncio.to_thread(is_ollama_model_loaded),
         asyncio.to_thread(is_ollama_model_loaded, SUMMARY_OLLAMA_MODEL),
+        asyncio.to_thread(is_ollama_model_loaded, VISION_OLLAMA_MODEL),
         asyncio.to_thread(is_embed_model_available),
         asyncio.to_thread(mem_store.stats, interaction.channel_id),
     )
@@ -1614,6 +1853,11 @@ async def status(interaction: discord.Interaction):
         f"- Ollama: {SUMMARY_OLLAMA_MODEL}\n"
         f"- {'🟢 Loaded' if summary_loaded else '🔴 Not loaded'}\n"
         f"- OpenRouter: {SUMMARY_MODEL}\n\n"
+
+        f"**Image model**\n"
+        f"- Ollama: {VISION_OLLAMA_MODEL}\n"
+        f"- {'🟢 Loaded' if vision_loaded else '🔴 Not loaded'}\n"
+        f"- OpenRouter: {VISION_MODEL}\n\n"
 
         f"**HNSW index**\n"
         f"- {'🟢 Loaded' if index is not None else '🔴 Missing'}\n"
@@ -1791,6 +2035,8 @@ async def on_message(message):
         reply_to = message.reference.message_id
 
     _track_channel(message.channel.id)
+    msg_attachments = mem_vision.classify_attachments(
+        getattr(message, "attachments", []))
     await asyncio.to_thread(
         add_message,
         message.channel.id,
@@ -1800,6 +2046,7 @@ async def on_message(message):
         message.content,
         reply_to,
         str(message.author.id),
+        msg_attachments,
     )
 
     if client.user not in message.mentions:
@@ -1843,11 +2090,27 @@ async def on_message(message):
     async with lock:
         try:
             async with message.channel.typing():
+                # First (and only) image: own upload, link, or replied-to.
+                image_block = ""
+                source_key, image_url = await resolve_prompt_image(message)
+                if source_key and image_url:
+                    desc, cached = await describe_image(
+                        source_key, image_url)
+                    if desc:
+                        log.info("[vision] description ready (%d chars, cached=%s)",
+                                 len(desc), cached)
+                        image_block = (
+                            f"\nImage attached by {message.author}: "
+                            f"{desc}\n(Only refer to it if relevant to the "
+                            f"conversation.)\n"
+                        )
+
                 prompt = await build_prompt(
                     message.channel.id,
                     cleaned,
                     str(message.author),
                     str(message.author.id),
+                    image_block,
                 )
 
                 log.debug("PROMPT SENT TO MODEL (%d chars):\n%s\n[END PROMPT]",

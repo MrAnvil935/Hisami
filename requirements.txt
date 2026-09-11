@@ -18,3 +18,4 @@ tqdm==4.68.3
 urllib3==2.7.0
 yarl==1.24.2
 beautifulsoup4==4.15.0
+Pillow==12.3.0

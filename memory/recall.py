@@ -45,6 +45,27 @@ def _fts_query(tokens):
     return " OR ".join(tokens)
 
 
+def rank_by_overlap(items, query, text_key="fact", time_key="updated_at"):
+    """Rank dicts by keyword overlap with query (desc), recency tiebreak.
+
+    Zero-overlap falls back to pure recency order, matching the legacy
+    injection behavior. Pure function (no I/O) so it is unit-testable.
+    """
+    query_tokens = set(tokenize(query, max_tokens=20))
+    scored = []
+    for item in items:
+        text = str(item.get(text_key) or "").lower()
+        overlap = (sum(1 for t in query_tokens if t in text)
+                   if query_tokens else 0)
+        try:
+            ts = float(item.get(time_key) or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        scored.append((overlap, ts, item))
+    scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+    return [s[2] for s in scored]
+
+
 def search_messages(channel_id, query, limit=5):
     """Return up to `limit` past messages relevant to query.
 

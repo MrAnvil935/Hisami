@@ -8,7 +8,7 @@ The bot builds an embedding index from exported Discord messages and uses it as 
 * Local embeddings using `nomic-embed-text`
 * HNSW vector search for fast example retrieval
 * Persistent per-channel conversation memory (SQLite)
-* Long-term memory: channel summaries + per-user facts + keyword recall
+* Long-term memory: channel summaries + relevance-ranked user facts + keyword recall
 * Static style profile distilled once from the embedding corpus
 * Web search (DuckDuckGo) for questions about current events
 * Slash commands for status information and maintenance
@@ -93,6 +93,9 @@ Tunable groups (all have built-in defaults, see `config.json`):
 * `model` / `fallback_model` — main chat chain (local Ollama first, then OpenRouter)
 * `summary_ollama_model` / `summary_model` — background chain for memory
   summarization and fact extraction (local first, OpenRouter last resort)
+* `vision_ollama_model` / `vision_model` — image description chain
+  (local first, OpenRouter last resort); see `vision_*` limits.
+  Both models must be vision-capable (text-only models return nothing useful).
 * `max_examples` / `examples_max_tokens` — style-example retrieval limits
 * `memory_*` — buffer size, summary chunk size, recall limits, cooldowns
 * `search_*` — web search triggers and limits
@@ -141,7 +144,7 @@ OpenRouter. If Ollama is down entirely, the bot degrades gracefully
 ## Memory system
 
 Short-term history lives in `memory.db` (SQLite, WAL mode) instead of RAM,
-so it survives restarts. On top of that, three long-term layers feed every
+so it survives restarts. On top of that, long-term layers feed every
 prompt:
 
 * **Channel summaries** — every 30 messages per channel are summarized by the
@@ -149,10 +152,18 @@ prompt:
   budget, so long messages don't bloat the raw window); the 2 most relevant
   are injected.
 * **Per-user facts** — durable traits extracted for all speakers batched
-  on each summary chunk; top 5 per user are injected.
+  on each summary chunk. At prompt time facts are ranked by keyword overlap
+  with the current message (recency tiebreak), so a topical old fact beats
+  newer trivial ones; top 5 per user are injected.
 * **Peer recall** — when someone mentions, names, or chats alongside other
   users, their facts are injected too (`Known about <name>:`), so the bot
-  can answer *about* people, not just *to* the author.
+  can answer *about* people, not just *to* the author. Name matching is
+  whole-word and nickname-tolerant (`nos` matches speaker `nos_yous`).
+* **Image understanding** — the first image in a ping (upload, link, or
+  replied-to message) is downscaled to 512px and described by a separate
+  local-first vision chain; descriptions are cached by source URL.
+  Videos are never processed, but history lines are annotated
+  (`[image: foo.png]`, `[video: bar.mp4]`) so the model knows media exists.
 * **Keyword recall** — FTS5 search over past messages, top 3 injected.
 
 `/clearmemory` clears only the recent short-term buffer (to unstick a looping
@@ -184,7 +195,8 @@ Terminal output stays at INFO (one line per model call). Full detail goes to
   (`PROMPT SENT TO MODEL … [END PROMPT]`) and per-section sizes.
 * `logs/llm.jsonl` — one pretty-printed JSON object per LLM call with full
   request/response bodies, purpose tag (`chat`, `prompt`, `summary`,
-  `facts`), latency and status. Never contains HTTP headers (no API keys).
+  `facts`, `vision`), latency and status. Never contains HTTP headers
+  (no API keys); image bytes are logged as size placeholders, not blobs.
   Rotated with `.1`, `.2` backups.
 
 Useful commands:
@@ -205,8 +217,8 @@ venv/bin/python -m unittest discover -s tests -v
 ```
 
 Covers the `memory/` package (store, buffer, recall, facts, summaries,
-examples, log dump, style profile) with stdlib `unittest` only. `bot.py`
-itself is not imported by tests.
+examples, log dump, style profile, vision) with stdlib `unittest` only.
+`bot.py` itself is not imported by tests.
 
 ---
 
@@ -215,14 +227,15 @@ itself is not imported by tests.
 ```
 bot.py             Discord bot (events, prompt assembly, generation)
 memory/            Persistent memory package (SQLite + retrieval helpers)
-  store.py         Schema, message/summary/fact persistence (WAL + FTS5)
+  store.py         Schema, message/summary/fact/image-cache persistence (WAL + FTS5)
   buffer.py        Token-aware short-term window
-  recall.py        Keyword recall over past messages
+  recall.py        Keyword recall, peer-user detection, fact ranking
   summary.py       Summarizer and fact-extraction prompt builders
   facts.py         Fact JSON parsing + speaker resolution
   examples.py      Style-example compaction + token budgeting
   llmlog.py        Full-bodied LLM call dump (llm.jsonl)
   styleprofile.py  Corpus sampling + distillation helpers
+  vision.py        Image detection, downscaling, prompt markers
 style_profile.py   Manual static style-profile generator
 converter.py       Converts Discord exports into a dataset
 embed.py           Builds the HNSW embedding index
@@ -242,7 +255,8 @@ style_profile.txt  Static style profile (generated + hand-edited)
 
 * This project is intended for personal and educational use.
 * Do not commit `config.json` with real tokens, `venv/`, `logs/`,
-  `memory.db`, `index.bin` or `texts.json` — see `.gitignore`.
+  `memory.db`, `index.bin`, `texts.json` or your `style_profile.txt`
+  (persona-specific) — see `.gitignore`.
 * The quality of the bot depends heavily on the amount of Discord messages available, the prompt, and the language model being used. Larger models generally produce noticeably better results.
 * The bot has been tested on both desktop Linux and **Termux**. It should run anywhere Python and the required dependencies are supported.
 * This project was developed with significant assistance from generative AI tools. While all code has been reviewed and adapted for this project, AI played a major role in development, debugging, and refinement.

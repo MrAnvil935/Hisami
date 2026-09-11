@@ -10,8 +10,10 @@ Tables:
   summaries     - long-term episodic memory per channel
   user_facts    - durable per-user facts
   channel_state - summarizer bookkeeping
+  image_cache   - vision descriptions keyed by image source URL
 """
 
+import json
 import sqlite3
 import time
 
@@ -29,6 +31,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content     TEXT NOT NULL DEFAULT '',
     reply_to    INTEGER,
     created_at  REAL NOT NULL,
+    attachments TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (channel_id, msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, msg_id);
@@ -59,6 +62,12 @@ CREATE TABLE IF NOT EXISTS channel_state (
     channel_id         TEXT PRIMARY KEY,
     last_summary_upto  INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS image_cache (
+    key         TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
 """
 
 
@@ -81,6 +90,10 @@ def init_db(path: str | None = None):
     con = _connect()
     try:
         con.executescript(SCHEMA)
+        # migrate pre-attachments databases in place
+        cols = [r[1] for r in con.execute("PRAGMA table_info(messages)")]
+        if "attachments" not in cols:
+            con.execute("ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
         con.commit()
     finally:
         con.close()
@@ -89,7 +102,7 @@ def init_db(path: str | None = None):
 # ---------------- messages ----------------
 
 def add_message(channel_id, msg_id, author_id, author_name, role,
-                content, reply_to=None, created_at=None):
+                content, reply_to=None, created_at=None, attachments=None):
     created_at = created_at if created_at is not None else time.time()
     # msg_id may be str (discord snowflake) — store as int when possible
     try:
@@ -101,14 +114,21 @@ def add_message(channel_id, msg_id, author_id, author_name, role,
             reply_to = int(reply_to)
         except (TypeError, ValueError):
             reply_to = None
+    try:
+        attachments_json = json.dumps([
+            {"kind": a.get("kind"), "name": a.get("name")}
+            for a in (attachments or []) if a.get("kind") in ("image", "video")
+        ], ensure_ascii=False)
+    except Exception:
+        attachments_json = "[]"
     con = _connect()
     try:
         con.execute(
             """INSERT OR REPLACE INTO messages
-               (channel_id, msg_id, author_id, author_name, role, content, reply_to, created_at)
-               VALUES (?,?,?,?,?,?,?,?)""",
+               (channel_id, msg_id, author_id, author_name, role, content, reply_to, created_at, attachments)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (str(channel_id), msg_id, str(author_id), str(author_name),
-             str(role), str(content), reply_to, created_at),
+             str(role), str(content), reply_to, created_at, attachments_json),
         )
         con.execute(
             "DELETE FROM messages_fts WHERE channel_id=? AND msg_id=?",
@@ -129,14 +149,22 @@ def get_recent(channel_id, limit=50):
     try:
         rows = con.execute(
             """SELECT channel_id, msg_id, author_id, author_name, role,
-                      content, reply_to, created_at
+                      content, reply_to, created_at, attachments
                FROM messages WHERE channel_id=? ORDER BY msg_id DESC LIMIT ?""",
             (str(channel_id), int(limit)),
         ).fetchall()
     finally:
         con.close()
     # oldest -> newest
-    return [dict(r) for r in reversed(rows)]
+    out = []
+    for r in reversed(rows):
+        d = dict(r)
+        try:
+            d["attachments"] = json.loads(d.get("attachments") or "[]")
+        except Exception:
+            d["attachments"] = []
+        out.append(d)
+    return out
 
 
 def get_message_count(channel_id):
@@ -315,9 +343,24 @@ def upsert_fact(user_id, fact, confidence=1.0):
         con.close()
 
 
-def get_facts(user_id, limit=5):
+def get_facts(user_id, limit=5, query=None):
     con = _connect()
     try:
+        if query:
+            # relevance path: rank a bounded recency pool by keyword
+            # overlap so topical (even old) facts win; pure recency
+            # tiebreak preserves legacy order when nothing matches.
+            from .recall import rank_by_overlap
+            rows = con.execute(
+                """SELECT fact, confidence, updated_at FROM user_facts
+                   WHERE user_id=? ORDER BY confidence DESC, updated_at DESC
+                   LIMIT 20""",
+                (str(user_id),),
+            ).fetchall()
+            ranked = rank_by_overlap(
+                [dict(r) for r in rows], query,
+                text_key="fact", time_key="updated_at")
+            return ranked[:int(limit)]
         rows = con.execute(
             """SELECT fact, confidence, updated_at FROM user_facts
                WHERE user_id=? ORDER BY confidence DESC, updated_at DESC LIMIT ?""",
@@ -339,6 +382,47 @@ def get_fact_count(user_id=None):
                 (str(user_id),),
             ).fetchone()
         return row["c"]
+    finally:
+        con.close()
+
+
+# ---------------- image cache ----------------
+
+def get_image_desc(key, ttl_seconds=7 * 86400):
+    """Return cached vision description, or '' on miss/expiry."""
+    con = _connect()
+    try:
+        row = con.execute(
+            "SELECT description, created_at FROM image_cache WHERE key=?",
+            (str(key),),
+        ).fetchone()
+    finally:
+        con.close()
+    if not row:
+        return ""
+    if time.time() - row["created_at"] > ttl_seconds:
+        return ""
+    return row["description"] or ""
+
+
+def set_image_desc(key, description, max_rows=200):
+    con = _connect()
+    try:
+        con.execute(
+            """INSERT INTO image_cache (key, description, created_at)
+               VALUES (?,?,?)
+               ON CONFLICT(key) DO UPDATE SET
+                 description=excluded.description, created_at=excluded.created_at""",
+            (str(key), str(description), time.time()),
+        )
+        # cap size: drop oldest beyond max_rows
+        con.execute(
+            """DELETE FROM image_cache WHERE key NOT IN (
+                   SELECT key FROM image_cache ORDER BY created_at DESC LIMIT ?
+               )""",
+            (int(max_rows),),
+        )
+        con.commit()
     finally:
         con.close()
 
