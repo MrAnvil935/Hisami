@@ -10,12 +10,34 @@ import sqlite3
 from . import store
 
 _WORD_RE = re.compile(r"[a-z0-9]{2,}")
+_MENTION_RE = re.compile(r"<@!?(\d+)>")
+_NAME_SPLIT_RE = re.compile(r"[_\-.\s]+")
 
 
 def tokenize(text: str, max_tokens=10):
     if not text:
         return []
     return _WORD_RE.findall(str(text).lower())[:max_tokens]
+
+
+def name_mentioned(name, lowered_text, text_words=None):
+    """True if display `name` is referenced in already-lowered text.
+
+    Multi-word names match as a substring ("Ann Marie"); single tokens
+    match as whole words only, so short forms hit ("nos" from "nos_yous")
+    while prefixes don't ("bob" must not fire on "bobby"). Minimum 3
+    chars per matchable unit guards against nicks like "Al". Pure function.
+    """
+    name_l = str(name or "").lower()
+    if text_words is None:
+        text_words = set(_WORD_RE.findall(lowered_text))
+    tokens = [t for t in _NAME_SPLIT_RE.split(name_l) if t]
+    if len(tokens) > 1 and len(name_l) >= 3 and name_l in lowered_text:
+        return True
+    for tok in tokens:
+        if len(tok) >= 3 and tok in text_words:
+            return True
+    return False
 
 
 def _fts_query(tokens):
@@ -70,3 +92,66 @@ def search_messages(channel_id, query, limit=5):
         return [dict(r) for r in rows]
     finally:
         con.close()
+
+
+def find_referenced_users(messages, author_id, current_text="", max_users=2):
+    """Find OTHER users relevant to the current message.
+
+    Sources, in priority order:
+      1. Discord mentions (<@id>) in the current message text,
+      2. recent speakers whose display name appears in the current text,
+      3. other recent human speakers, newest first.
+
+    Returns (ordered_ids, names) where names maps id -> display name.
+    The message author (author_id) and assistant rows are always excluded.
+    Pure function (no I/O) so it is unit-testable.
+    """
+    self_id = str(author_id or "")
+    ordered, names = [], {}
+
+    def _add(uid, name=""):
+        uid = str(uid or "").strip()
+        if not uid or uid == self_id or uid in ordered:
+            return
+        if len(ordered) >= max_users:
+            return
+        ordered.append(uid)
+        if name and uid not in names:
+            names[uid] = name
+
+    text = str(current_text or "")
+
+    # 1. explicit mentions in the current message
+    for uid in _MENTION_RE.findall(text):
+        _add(uid)
+
+    # collect recent human speakers, newest first
+    speakers = []  # (uid, name)
+    for m in reversed(messages or []):
+        if m.get("role") == "assistant":
+            continue
+        uid = str(m.get("author_id") or "").strip()
+        name = str(m.get("author_name") or "").strip()
+        if not uid or uid == self_id:
+            continue
+        speakers.append((uid, name))
+        if name and uid not in names:
+            names[uid] = name
+
+    lowered = text.lower()
+    text_words = set(_WORD_RE.findall(lowered))
+
+    # 2. speakers named in the current message
+    for uid, name in speakers:
+        if uid in ordered or len(ordered) >= max_users:
+            continue
+        if name and name_mentioned(name, lowered, text_words):
+            _add(uid, name)
+
+    # 3. other recent speakers, newest first
+    for uid, name in speakers:
+        if len(ordered) >= max_users:
+            break
+        _add(uid, name)
+
+    return ordered, names

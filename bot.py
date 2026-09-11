@@ -75,12 +75,16 @@ BOTNAME = config["botname"]
 MEMORY_DB_PATH = config.get("memory_db_path", "memory.db")
 MEMORY_BUFFER_TOKENS = config.get("memory_buffer_tokens", 1500)
 MEMORY_BUFFER_MAX_MSGS = config.get("memory_buffer_max_msgs", 30)
-MEMORY_SUMMARY_CHUNK = config.get("memory_summary_chunk", 40)
+MEMORY_SUMMARY_CHUNK = config.get("memory_summary_chunk", 30)
+MEMORY_SUMMARY_CHUNK_TOKENS = config.get("memory_summary_chunk_tokens", 3000)
+MEMORY_SUMMARY_MIN_MSGS = config.get("memory_summary_min_msgs", 10)
 MEMORY_FACTS_ENABLED = config.get("memory_facts_enabled", True)
 MEMORY_RECALL_ENABLED = config.get("memory_recall_enabled", True)
 MEMORY_RECALL_LIMIT = config.get("memory_recall_limit", 3)
+MEMORY_PEER_MAX_USERS = config.get("memory_peer_max_users", 2)
+MEMORY_PEER_MAX_FACTS = config.get("memory_peer_max_facts", 3)
 COOLDOWN_SECONDS = config.get("cooldown_seconds", 5)
-MEMORY_PRUNE_KEEP = config.get("memory_prune_keep", 200)
+MEMORY_PRUNE_KEEP = config.get("memory_prune_keep", 60)
 
 # ---- background summarizer: separate local-first chain ----
 # User tunes both model names via config. Local summary model is tried
@@ -595,7 +599,7 @@ async def get_memory_context(channel_id, user_message, author_id=""):
     Fail-soft: any error -> ''.
     """
     try:
-        summaries, recalled, facts = await asyncio.gather(
+        summaries, recalled, facts, recent = await asyncio.gather(
             asyncio.to_thread(
                 mem_store.search_summaries, channel_id, user_message, 2),
             asyncio.to_thread(
@@ -605,6 +609,9 @@ async def get_memory_context(channel_id, user_message, author_id=""):
             asyncio.to_thread(
                 mem_store.get_facts, author_id, 5)
             if (MEMORY_FACTS_ENABLED and author_id) else asyncio.sleep(0, result=[]),
+            asyncio.to_thread(
+                mem_store.get_recent, channel_id, 15)
+            if MEMORY_FACTS_ENABLED else asyncio.sleep(0, result=[]),
         )
     except Exception:
         log.exception("memory recall failed")
@@ -623,6 +630,28 @@ async def get_memory_context(channel_id, user_message, author_id=""):
     if facts:
         f_lines = "\n".join(f"- {f['fact']}" for f in facts)
         blocks.append(f"\nKnown about this user:\n{f_lines}\n")
+
+    # Peer facts: other users referenced by mention, by name, or simply
+    # speaking recently — so the model can answer ABOUT them, not just
+    # about the author. Fail-soft independently of the blocks above.
+    if MEMORY_FACTS_ENABLED and MEMORY_PEER_MAX_USERS > 0:
+        try:
+            peer_ids, peer_names = mem_recall.find_referenced_users(
+                recent, author_id, user_message, MEMORY_PEER_MAX_USERS)
+            if peer_ids:
+                peer_facts = await asyncio.gather(*[
+                    asyncio.to_thread(
+                        mem_store.get_facts, uid, MEMORY_PEER_MAX_FACTS)
+                    for uid in peer_ids
+                ])
+                for uid, pf in zip(peer_ids, peer_facts):
+                    if pf:
+                        label = peer_names.get(uid, f"user {uid}")
+                        p_lines = "\n".join(f"- {f['fact']}" for f in pf)
+                        blocks.append(f"\nKnown about {label}:\n{p_lines}\n")
+        except Exception:
+            log.exception("peer fact recall failed")
+
     return "".join(blocks)
 
 
@@ -1386,7 +1415,8 @@ _last_fact_run = {}
 async def summarize_channel(channel_id):
     """Summarize one chunk of unsummarized messages for a channel."""
     chunk = await asyncio.to_thread(
-        mem_store.get_unsummarized, channel_id, MEMORY_SUMMARY_CHUNK)
+        mem_store.get_unsummarized, channel_id, MEMORY_SUMMARY_CHUNK,
+        MEMORY_SUMMARY_CHUNK_TOKENS, MEMORY_SUMMARY_MIN_MSGS)
     if not chunk:
         return False
     try:
@@ -1417,8 +1447,7 @@ async def summarize_channel(channel_id):
 async def extract_chunk_facts(channel_id, chunk):
     """Extract facts for ALL human speakers in a summarized chunk.
 
-    One summary-chain call per chunk. Shares the per-user debounce with
-    the live single-user path so neither double-bills a user.
+    One summary-chain call per chunk, debounced per user.
     """
     if not MEMORY_FACTS_ENABLED:
         return
@@ -1472,7 +1501,8 @@ async def memory_maintenance_loop():
                         continue
                     # only touch channels with recent unsummarized backlog
                     chunk = await asyncio.to_thread(
-                        mem_store.get_unsummarized, ch.id, MEMORY_SUMMARY_CHUNK)
+                        mem_store.get_unsummarized, ch.id, MEMORY_SUMMARY_CHUNK,
+                        MEMORY_SUMMARY_CHUNK_TOKENS, MEMORY_SUMMARY_MIN_MSGS)
                     if chunk:
                         await summarize_channel(ch.id)
                         await asyncio.sleep(2)  # don't hammer the LLM
@@ -1489,33 +1519,6 @@ def _track_channel(channel_id):
     if not hasattr(_track_channel, "seen"):
         _track_channel.seen = set()
     _track_channel.seen.add(str(channel_id))
-
-
-async def maybe_extract_facts(channel_id, user_id, username):
-    """Debounced per-user fact extraction (max 1 run / 10 min / user)."""
-    if not MEMORY_FACTS_ENABLED or not user_id:
-        return
-    now = time.time()
-    if now - _last_fact_run.get(str(user_id), 0) < 600:
-        return
-    _last_fact_run[str(user_id)] = now
-    try:
-        recent = await asyncio.to_thread(
-            mem_store.get_recent, channel_id, 10)
-        if not recent:
-            return
-        prompt = mem_summary.build_fact_prompt(username, recent)
-        raw = await summary_generate([
-            {"role": "system", "content":
-             "You extract stable user facts as JSON. Return ONLY a JSON array."},
-            {"role": "user", "content": prompt},
-        ], purpose="facts")
-        for fact in mem_facts.parse_facts_json(raw or ""):
-            await asyncio.to_thread(
-                mem_store.upsert_fact, user_id, fact, 1.0)
-        log.info("[memory] fact extraction done for %s", username)
-    except Exception:
-        log.exception("[memory] fact extraction failed")
 
 # ============================================================
 # DISCORD
@@ -1881,15 +1884,6 @@ async def on_message(message):
                     reply,
                     message.id,
                     str(client.user.id) if client.user else "assistant",
-                )
-
-                # fire-and-forget long-term learning (never blocks reply)
-                asyncio.create_task(
-                    maybe_extract_facts(
-                        message.channel.id,
-                        str(message.author.id),
-                        str(message.author),
-                    )
                 )
 
         except Exception:

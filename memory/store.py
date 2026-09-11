@@ -372,8 +372,22 @@ def set_last_summary_upto(channel_id, msg_id):
         con.close()
 
 
-def get_unsummarized(channel_id, chunk_size=40):
-    """Return oldest unsummarized messages if a full chunk is ready, else []."""
+def _estimate_tokens(text):
+    # mirrors buffer.estimate_tokens (kept local to avoid a circular import)
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+
+def get_unsummarized(channel_id, chunk_size=30, chunk_tokens=None, min_msgs=10):
+    """Return oldest unsummarized messages when a chunk is ready, else [].
+
+    Ready means either:
+      - count reached chunk_size, or
+      - estimated tokens reached chunk_tokens (with at least min_msgs),
+        so long verbose messages trigger summarization early instead of
+        bloating the raw window.
+    """
     upto = get_last_summary_upto(channel_id)
     con = _connect()
     try:
@@ -384,9 +398,14 @@ def get_unsummarized(channel_id, chunk_size=40):
         ).fetchall()
     finally:
         con.close()
-    if len(rows) < int(chunk_size):
-        return []
-    return [dict(r) for r in rows]
+    rows = [dict(r) for r in rows]
+    if len(rows) >= int(chunk_size):
+        return rows
+    if (chunk_tokens and len(rows) >= int(min_msgs)
+            and sum(_estimate_tokens(r.get("content")) for r in rows)
+            >= int(chunk_tokens)):
+        return rows
+    return []
 
 
 # ---------------- stats ----------------

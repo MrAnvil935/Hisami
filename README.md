@@ -144,11 +144,15 @@ Short-term history lives in `memory.db` (SQLite, WAL mode) instead of RAM,
 so it survives restarts. On top of that, three long-term layers feed every
 prompt:
 
-* **Channel summaries** — every 40 messages per channel are summarized by the
-  background chain into `summaries`; the 2 most relevant are injected.
-* **Per-user facts** — durable traits extracted for the mentioning user live
-  (`maybe_extract_facts`) and for all speakers batched on each summary chunk
-  (`extract_chunk_facts`); top 5 per user are injected.
+* **Channel summaries** — every 30 messages per channel are summarized by the
+  background chain into `summaries` (or earlier if the backlog passes a token
+  budget, so long messages don't bloat the raw window); the 2 most relevant
+  are injected.
+* **Per-user facts** — durable traits extracted for all speakers batched
+  on each summary chunk; top 5 per user are injected.
+* **Peer recall** — when someone mentions, names, or chats alongside other
+  users, their facts are injected too (`Known about <name>:`), so the bot
+  can answer *about* people, not just *to* the author.
 * **Keyword recall** — FTS5 search over past messages, top 3 injected.
 
 `/clearmemory` clears only the recent short-term buffer (to unstick a looping

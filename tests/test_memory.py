@@ -86,6 +86,30 @@ class StoreTest(TempDBMixin, unittest.TestCase):
         mem_store.set_last_summary_upto("c1", 40)
         self.assertEqual(mem_store.get_unsummarized("c1", 40), [])
 
+    def test_summary_early_token_trigger(self):
+        # 12 long messages: under count 30 but over 3000-token budget
+        for i in range(1, 13):
+            mem_store.add_message(
+                "ct", i, "u1", "alice", "user", "x" * 1200)
+        chunk = mem_store.get_unsummarized(
+            "ct", 30, chunk_tokens=3000, min_msgs=10)
+        self.assertEqual(len(chunk), 12)
+
+    def test_summary_min_msgs_guard(self):
+        # token budget hit but too few messages -> no silly tiny summary
+        for i in range(1, 6):
+            mem_store.add_message(
+                "cm", i, "u1", "alice", "user", "x" * 2000)
+        self.assertEqual(
+            mem_store.get_unsummarized("cm", 30, chunk_tokens=3000,
+                                       min_msgs=10), [])
+
+    def test_summary_default_chunk_size(self):
+        self._seed(channel="cd", n=29)
+        self.assertEqual(mem_store.get_unsummarized("cd"), [])
+        mem_store.add_message("cd", 30, "u1", "alice", "user", "thirtieth")
+        self.assertEqual(len(mem_store.get_unsummarized("cd")), 30)
+
 
 class BufferTest(TempDBMixin, unittest.TestCase):
     def test_token_budget_trims_oldest(self):
@@ -108,6 +132,76 @@ class RecallTest(TempDBMixin, unittest.TestCase):
         hits = mem_recall.search_messages("c1", "skyblock minecraft server")
         self.assertTrue(hits)
         self.assertIn("skyblock", hits[0]["content"])
+
+    def test_referenced_users_mention(self):
+        msgs = [
+            {"author_id": "u1", "author_name": "alice", "role": "user",
+             "content": "hi"},
+        ]
+        ids, names = mem_recall.find_referenced_users(
+            msgs, "u9", "what does <@123> like?", max_users=2)
+        # explicit mention first, recent speakers fill remaining slots
+        self.assertEqual(ids, ["123", "u1"])
+        self.assertEqual(names, {"u1": "alice"})
+
+    def test_referenced_users_name_and_speakers(self):
+        msgs = [
+            {"author_id": "u1", "author_name": "alice", "role": "user",
+             "content": "hello"},
+            {"author_id": "u2", "author_name": "bob", "role": "user",
+             "content": "hey"},
+            {"author_id": "b", "author_name": "Assistant", "role": "assistant",
+             "content": "xd"},
+        ]
+        # named speaker wins over recency
+        ids, names = mem_recall.find_referenced_users(
+            msgs, "u9", "does alice play osu?", max_users=2)
+        self.assertEqual(ids[0], "u1")
+        self.assertEqual(names["u1"], "alice")
+        # no name match -> newest speakers first, self + bot excluded
+        ids, _ = mem_recall.find_referenced_users(
+            msgs, "u2", "what is everyone up to?", max_users=2)
+        self.assertEqual(ids, ["u1"])
+        self.assertNotIn("b", ids)
+
+    def test_referenced_users_cap_and_self(self):
+        msgs = [
+            {"author_id": "u1", "author_name": "alice", "role": "user",
+             "content": "a"},
+            {"author_id": "u2", "author_name": "bob", "role": "user",
+             "content": "b"},
+        ]
+        ids, _ = mem_recall.find_referenced_users(
+            msgs, "u1", "hi all", max_users=1)
+        self.assertEqual(ids, ["u2"])
+        ids, _ = mem_recall.find_referenced_users([], "u1", "hi", max_users=2)
+        self.assertEqual(ids, [])
+
+    def test_nickname_matching(self):
+        # token of an underscored name matches ("nos" from "nos_yous")
+        self.assertTrue(mem_recall.name_mentioned(
+            "nos_yous", "does nos play osu?"))
+        # dash/dot/space-separated tokens match whole words
+        self.assertTrue(mem_recall.name_mentioned(
+            "Ann-Marie", "ask ann about it"))
+        self.assertTrue(mem_recall.name_mentioned(
+            "Ann Marie", "ann marie is here"))
+        # no substring false positives ("bob" must not fire on "bobby")
+        self.assertFalse(mem_recall.name_mentioned("bob", "bobby is here"))
+        self.assertTrue(mem_recall.name_mentioned("bob", "hey bob!"))
+        # short names never match
+        self.assertFalse(mem_recall.name_mentioned("Al", "say hi to al"))
+        self.assertFalse(mem_recall.name_mentioned("", "hello"))
+
+    def test_referenced_users_nickname(self):
+        msgs = [
+            {"author_id": "u7", "author_name": "nos_yous", "role": "user",
+             "content": "i main inkling"},
+        ]
+        ids, names = mem_recall.find_referenced_users(
+            msgs, "u9", "is nos good at splatoon?", max_users=2)
+        self.assertEqual(ids[0], "u7")
+        self.assertEqual(names["u7"], "nos_yous")
 
 
 class FactsTest(unittest.TestCase):
