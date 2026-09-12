@@ -10,7 +10,9 @@ The bot builds an embedding index from exported Discord messages and uses it as 
 * Persistent per-channel conversation memory (SQLite)
 * Long-term memory: channel summaries + relevance-ranked user facts + keyword recall
 * Static style profile distilled once from the embedding corpus
-* Web search (DuckDuckGo) for questions about current events
+* Web search (DuckDuckGo, 3 retries on failure) for questions about
+  current events, plus a `/web` command showing raw results with no AI
+  involved (result count 1–10, default 5)
 * Slash commands for status information and maintenance
 * Two-sink debug logging: concise terminal + full payloads on disk
 
@@ -231,6 +233,7 @@ memory/            Persistent memory package (SQLite + retrieval helpers)
   buffer.py        Token-aware short-term window
   recall.py        Keyword recall, peer-user detection, fact ranking
   summary.py       Summarizer and fact-extraction prompt builders
+  web.py           Web-result rendering for Components V2
   facts.py         Fact JSON parsing + speaker resolution
   examples.py      Style-example compaction + token budgeting
   llmlog.py        Full-bodied LLM call dump (llm.jsonl)

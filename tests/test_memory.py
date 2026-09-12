@@ -22,6 +22,7 @@ from memory import store as mem_store
 from memory import styleprofile as mem_styleprofile
 from memory import summary as mem_summary
 from memory import vision as mem_vision
+from memory import web as mem_web
 
 
 class TempDBMixin:
@@ -428,6 +429,30 @@ class StyleProfileTest(unittest.TestCase):
         msgs = style_profile.build_messages(["xd"])
         self.assertEqual([m["role"] for m in msgs], ["system", "user"])
         self.assertIn("xd", msgs[1]["content"])
+
+
+class WebFormatTest(unittest.TestCase):
+    def test_numbering_and_links(self):
+        out = mem_web.format_web_results([
+            {"title": "A", "url": "https://a.test", "snippet": "snip a"},
+            {"title": "", "url": "", "snippet": ""},
+        ])
+        self.assertIn("### [1] [A](https://a.test)", out)
+        self.assertIn("snip a", out)
+        self.assertIn("### [2] [No title]()", out)
+
+    def test_empty(self):
+        self.assertEqual(mem_web.format_web_results([]), "")
+
+    def test_truncation(self):
+        big = [{"title": f"t{i}", "url": f"https://x/{i}",
+                "snippet": "s" * 500} for i in range(10)]
+        out = mem_web.format_web_results(big, max_chars=1000)
+        self.assertLessEqual(len(out), 1000)
+        self.assertIn("could not fit", out)
+        # small budget keeps full text untouched
+        small = mem_web.format_web_results(big[:1])
+        self.assertNotIn("could not fit", small)
 
 
 class VisionTest(unittest.TestCase):

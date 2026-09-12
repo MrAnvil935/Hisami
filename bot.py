@@ -27,6 +27,7 @@ from memory import recall as mem_recall
 from memory import store as mem_store
 from memory import summary as mem_summary
 from memory import vision as mem_vision
+from memory import web as mem_web
 
 # Console (terminal) stays concise at INFO. Full bodies go to the
 # rotating file log + llm.jsonl, wired up after config load below.
@@ -94,7 +95,7 @@ MEMORY_PRUNE_KEEP = config.get("memory_prune_keep", 60)
 SUMMARY_OLLAMA_MODEL = config.get("summary_ollama_model", "gemma3n:e4b")
 SUMMARY_MODEL = config.get("summary_model", "openrouter/free")
 SUMMARY_TEMPERATURE = config.get("summary_temperature", 0.2)
-SUMMARY_MAX_TOKENS = config.get("summary_max_tokens", 500)
+SUMMARY_MAX_TOKENS = config.get("summary_max_tokens", 800)
 SUMMARY_OLLAMA_TIMEOUT = config.get("summary_ollama_timeout", 60)
 SUMMARY_TIMEOUT = config.get("summary_timeout", 60)
 SUMMARY_MAX_RETRIES = config.get("summary_max_retries", 1)
@@ -176,6 +177,9 @@ STATUS_COMMAND_NAME = config["status_command_name"]
 STATUS_COMMAND_DESCRIPTION = config["status_command_description"]
 PROMPT_COMMAND_NAME = config["prompt_command_name"]
 PROMPT_COMMAND_DESCRIPTION = config["prompt_command_description"]
+WEB_COMMAND_NAME = config.get("web_command_name", "web")
+WEB_COMMAND_DESCRIPTION = config.get(
+    "web_command_description", "Search the web, no AI involved")
 
 # Don't touch those unless you know what you are doing
 
@@ -408,6 +412,8 @@ SEARCH_SHORT_MESSAGE_WORDS = config.get("search_short_message_words", 5)
 
 SEARCH_TIMEOUT = config.get("search_timeout", 15)
 
+SEARCH_MAX_RETRIES = config.get("search_max_retries", 3)
+
 SEARCH_TRIGGERS = tuple(config.get("search_triggers", [
     "?",
     "latest",
@@ -520,40 +526,70 @@ def _parse_lite_results(html_text, max_results):
     return results
 
 
-def web_search(query, max_results=SEARCH_MAX_RESULTS):
-    """Blocking — call from async code with asyncio.to_thread()."""
-    try:
+def _web_search_once(query, max_results):
+    """Single html -> lite attempt. Returns (status, results).
+
+    status: 'ok' | 'blocked' (bot-check on both endpoints) | 'error'.
+    """
+    r = http.post(
+        "https://html.duckduckgo.com/html/",
+        data={"q": query},
+        headers=DDG_HEADERS,
+        timeout=SEARCH_TIMEOUT,
+    )
+    r.raise_for_status()
+
+    # ---- soft bot block: retry once against the lite endpoint ----
+    if r.status_code == 202 or _is_bot_page(r.text):
+        log.info("[search] DDG bot-check on html endpoint, trying lite")
+
         r = http.post(
-            "https://html.duckduckgo.com/html/",
+            "https://lite.duckduckgo.com/lite/",
             data={"q": query},
             headers=DDG_HEADERS,
             timeout=SEARCH_TIMEOUT,
         )
         r.raise_for_status()
 
-        # ---- soft bot block: retry once against the lite endpoint ----
         if r.status_code == 202 or _is_bot_page(r.text):
-            log.info("[search] DDG bot-check on html endpoint, trying lite")
+            log.warning("[search] DDG blocked both endpoints")
+            return "blocked", []
 
-            r = http.post(
-                "https://lite.duckduckgo.com/lite/",
-                data={"q": query},
-                headers=DDG_HEADERS,
-                timeout=SEARCH_TIMEOUT,
-            )
-            r.raise_for_status()
+        return "ok", _parse_lite_results(r.text, max_results)
 
-            if r.status_code == 202 or _is_bot_page(r.text):
-                log.warning("[search] DDG blocked both endpoints")
-                return []
+    return "ok", _parse_html_results(r.text, max_results)
 
-            return _parse_lite_results(r.text, max_results)
 
-        return _parse_html_results(r.text, max_results)
+def web_search(query, max_results=SEARCH_MAX_RESULTS):
+    """Blocking — call from async code with asyncio.to_thread().
 
-    except Exception as e:
-        log.warning("Web search failed: %s", e)
-        return []
+    Retries transport/parse failures (e.g. connection resets) up to
+    SEARCH_MAX_RETRIES total attempts. Bot-blocks are NOT retried.
+    """
+    for attempt in range(1, SEARCH_MAX_RETRIES + 1):
+        try:
+            status, results = _web_search_once(query, max_results)
+        except Exception as e:
+            log.warning("[search] attempt %d/%d failed: %s",
+                        attempt, SEARCH_MAX_RETRIES, e)
+            status, results = "error", []
+
+        if status == "ok" and results:
+            return results
+
+        if status == "blocked":
+            return []
+
+        if attempt < SEARCH_MAX_RETRIES:
+            delay = _retry_delay(attempt)
+            log.info("[search] retry %d/%d in %.2fs",
+                     attempt, SEARCH_MAX_RETRIES, delay)
+            # web_search is blocking; sleep via a throwaway loop-safe wait
+            time.sleep(delay)
+
+    log.warning("Web search failed after %d attempts: %r",
+                SEARCH_MAX_RETRIES, query)
+    return []
 
 
 def should_search(text):
@@ -1562,19 +1598,7 @@ class PromptView(discord.ui.LayoutView):
             return
 
         # Build a separate V2 message containing the search results.
-        web_text = "\n\n".join(
-            f"### [{i}] [{r.get('title', 'No title')}]({r.get('url', '')})\n"
-            f"{r.get('snippet', '')}"
-            for i, r in enumerate(results, 1)
-        )
-
-        # Don't allow the source display itself to exceed the V2 text budget.
-        if len(web_text) > 3800:
-            web_text = (
-                web_text[:3760]
-                + "\n\n… More results were returned "
-                "but could not fit in this message."
-            )
+        web_text = mem_web.format_web_results(results)
 
         container = discord.ui.Container()
         container.add_item(discord.ui.TextDisplay("## 🌐 Web search results"))
@@ -2004,6 +2028,55 @@ async def prompt_command(
         await interaction.followup.send(
             "Something went wrong while processing the prompt."
         )
+
+
+@tree.command(
+    name=WEB_COMMAND_NAME,
+    description=WEB_COMMAND_DESCRIPTION,
+)
+@discord.app_commands.describe(
+    query="What to search the web for.",
+    count="How many results to show (1-10).",
+)
+async def web_command(
+    interaction: discord.Interaction,
+    query: str,
+    count: discord.app_commands.Range[int, 1, 10] = 5,
+):
+    """Raw web search with no LLM involved."""
+    await interaction.response.defer()
+
+    if not SEARCH_ENABLED:
+        await interaction.followup.send("Web search is currently disabled.")
+        return
+
+    count = max(1, min(int(count), 10))
+    query = (query or "").strip()
+
+    if not query:
+        await interaction.followup.send("Give me something to search for.")
+        return
+
+    try:
+        results = await asyncio.to_thread(web_search, query, count)
+    except Exception:
+        log.exception("[web] command failed")
+        await interaction.followup.send("Search failed, try again later 💀")
+        return
+
+    if not results:
+        await interaction.followup.send(f"No results found for: {query}")
+        return
+
+    container = discord.ui.Container()
+    container.add_item(discord.ui.TextDisplay(f"## 🌐 {query}"))
+    container.add_item(
+        discord.ui.TextDisplay(mem_web.format_web_results(results[:count])))
+
+    view = discord.ui.LayoutView()
+    view.add_item(container)
+
+    await interaction.followup.send(view=view)
 
 
 @client.event
