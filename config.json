@@ -32,7 +32,7 @@
   "vision_ollama_model": "qwen2.5vl:3b",
   "vision_model": "openrouter/free",
   "vision_temperature": 0.2,
-  "vision_max_tokens": 300,
+  "vision_max_tokens": 500,
   "vision_timeout": 90,
   "vision_max_bytes": 10485760,
   "vision_cache_ttl_days": 7,
