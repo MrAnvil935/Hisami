@@ -24,7 +24,7 @@
   "summary_ollama_model": "gemma3n:e4b",
   "summary_model": "nex-agi/nex-n2.5-mini:free",
   "summary_temperature": 0.2,
-  "summary_max_tokens": 800,
+  "summary_max_tokens": 1200,
   "summary_ollama_timeout": 60,
   "summary_timeout": 60,
   "summary_max_retries": 1,
