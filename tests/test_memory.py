@@ -209,6 +209,30 @@ class RecallTest(TempDBMixin, unittest.TestCase):
                          ["likes hiking", "owns a farm", "plays minecraft daily"])
         self.assertEqual(mem_recall.rank_by_overlap(items, ""), ranked)
 
+    def test_channel_engaged(self):
+        msgs = [
+            {"content": "hello everyone"},
+            {"content": "hey <@123> what is up"},
+        ]
+        self.assertTrue(mem_recall.channel_engaged(msgs, "123"))
+        self.assertTrue(mem_recall.channel_engaged(msgs, "123", lookback=1))
+        # nickname mention form
+        self.assertTrue(mem_recall.channel_engaged(
+            [{"content": "yo <@!123>"}], "123"))
+        # longer ID must not false-positive on a bot-id prefix
+        self.assertFalse(mem_recall.channel_engaged(
+            [{"content": "hi <@12345>"}], "123"))
+        # no mention / empty / lookback window
+        self.assertFalse(mem_recall.channel_engaged(msgs, "999"))
+        self.assertFalse(mem_recall.channel_engaged([], "123"))
+        self.assertFalse(mem_recall.channel_engaged(msgs, "123", lookback=0))
+        old = [{"content": "hi <@123>"}] + [{"content": "x"}] * 5
+        self.assertFalse(mem_recall.channel_engaged(old, "123", lookback=5))
+        self.assertTrue(mem_recall.channel_engaged(old, "123", lookback=6))
+        # unknown bot fails open (never halts summarization)
+        self.assertTrue(mem_recall.channel_engaged([], ""))
+        self.assertTrue(mem_recall.channel_engaged([], None))
+
     def test_referenced_users_mention(self):
         msgs = [
             {"author_id": "u1", "author_name": "alice", "role": "user",

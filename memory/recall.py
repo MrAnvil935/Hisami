@@ -176,3 +176,23 @@ def find_referenced_users(messages, author_id, current_text="", max_users=2):
         _add(uid, name)
 
     return ordered, names
+
+
+def channel_engaged(messages, bot_id, lookback=30):
+    """True if the bot was mentioned within the last `lookback` messages.
+
+    Matches exact Discord mention syntax (<@id> / <@!id>) with a closing
+    '>' so longer IDs can't false-positive on a bot-id prefix. Unknown
+    or empty bot_id fails OPEN (returns True) so a momentarily missing
+    client.user never halts all summarization. Pure function (no I/O).
+    """
+    bot_id = str(bot_id or "").strip()
+    if not bot_id:
+        return True
+    if int(lookback) <= 0:
+        return False
+    pattern = re.compile(rf"<@!?{re.escape(bot_id)}>")
+    for m in list(messages or [])[-int(lookback):]:
+        if pattern.search(str(m.get("content") or "")):
+            return True
+    return False

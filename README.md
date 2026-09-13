@@ -152,7 +152,8 @@ prompt:
 * **Channel summaries** — every 30 messages per channel are summarized by the
   background chain into `summaries` (or earlier if the backlog passes a token
   budget, so long messages don't bloat the raw window); the 2 most relevant
-  are injected.
+  are injected. Channels with no bot mention in the recent buffer are skipped
+  until mentioned again (DMs always qualify).
 * **Per-user facts** — durable traits extracted for all speakers batched
   on each summary chunk. At prompt time facts are ranked by keyword overlap
   with the current message (recency tiebreak), so a topical old fact beats

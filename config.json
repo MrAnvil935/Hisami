@@ -11,6 +11,7 @@
   "memory_buffer_tokens": 1500,
   "memory_buffer_max_msgs": 30,
   "memory_summary_chunk": 30,
+  "memory_engage_lookback": 30,
   "memory_summary_chunk_tokens": 3000,
   "memory_summary_min_msgs": 10,
   "memory_facts_enabled": true,

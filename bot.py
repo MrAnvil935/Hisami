@@ -79,6 +79,7 @@ MEMORY_DB_PATH = config.get("memory_db_path", "memory.db")
 MEMORY_BUFFER_TOKENS = config.get("memory_buffer_tokens", 1500)
 MEMORY_BUFFER_MAX_MSGS = config.get("memory_buffer_max_msgs", 30)
 MEMORY_SUMMARY_CHUNK = config.get("memory_summary_chunk", 30)
+MEMORY_ENGAGE_LOOKBACK = config.get("memory_engage_lookback", 30)
 MEMORY_SUMMARY_CHUNK_TOKENS = config.get("memory_summary_chunk_tokens", 3000)
 MEMORY_SUMMARY_MIN_MSGS = config.get("memory_summary_min_msgs", 10)
 MEMORY_FACTS_ENABLED = config.get("memory_facts_enabled", True)
@@ -1760,12 +1761,18 @@ async def memory_maintenance_loop():
     seen = set()
     while not client.is_closed():
         try:
+            bot_id = str(client.user.id) if client.user else ""
             # discover channels from recent guilds to avoid unbounded growth
             for guild in client.guilds:
                 for ch in guild.text_channels:
                     # never compete with a live reply in the same channel
                     lock = _channel_locks.get(ch.id)
                     if lock is not None and lock.locked():
+                        continue
+                    # pause channels with no recent bot mention (saves LLM calls)
+                    if not await is_channel_engaged(ch.id, bot_id):
+                        log.debug("[memory] channel %s paused, "
+                                  "no recent mention", ch.id)
                         continue
                     # only touch channels with recent unsummarized backlog
                     chunk = await asyncio.to_thread(
@@ -1776,10 +1783,31 @@ async def memory_maintenance_loop():
                         await asyncio.sleep(2)  # don't hammer the LLM
             # also cover DM channels the bot has seen via cooldown map
             for channel_id in list(seen):
+                if not await is_channel_engaged(channel_id, bot_id):
+                    continue
                 await summarize_channel(channel_id)
         except Exception:
             log.exception("[memory] maintenance loop error")
         await asyncio.sleep(SUMMARY_INTERVAL)
+
+
+async def is_channel_engaged(channel_id, bot_id):
+    """True if the channel deserves background summarization.
+
+    DMs are always engaged; guild channels only when the bot was
+    mentioned within the recent lookback window. Fail-open on errors.
+    """
+    try:
+        ch = client.get_channel(int(channel_id))
+        if isinstance(ch, discord.DMChannel):
+            return True
+        recent = await asyncio.to_thread(
+            mem_store.get_recent, channel_id, MEMORY_ENGAGE_LOOKBACK)
+        return mem_recall.channel_engaged(
+            recent, bot_id, MEMORY_ENGAGE_LOOKBACK)
+    except Exception:
+        log.exception("[memory] engagement check failed for %s", channel_id)
+        return True
 
 
 def _track_channel(channel_id):
