@@ -254,6 +254,24 @@ style_profile.txt  Static style profile (generated + hand-edited)
 
 ---
 
+## License
+
+Copyright (c) 2026 MrAnvil935. Licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE)
+([canonical text](https://polyformproject.org/licenses/noncommercial/1.0.0)).
+
+In plain words: you may use, modify, and share this code for free for
+personal, educational, and research purposes. Any commercial use — selling
+it, hosting it as a paid service, bundling it into a commercial product,
+or otherwise using it for commercial advantage — requires separate
+permission from the copyright holder (contact via the GitHub repository).
+
+The license covers the code. Personal chat data (`texts.json`,
+`memory.db`, `style_profile.txt`) is gitignored and never distributed
+with the repository.
+
+---
+
 ## Notes
 
 * This project is intended for personal and educational use.

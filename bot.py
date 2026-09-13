@@ -772,25 +772,31 @@ async def build_prompt(channel_id, user_message, username, author_id="",
     # lookup table for reply context
     msg_map = {m["id"]: m for m in history}
 
+    # Recover reply parents that fell outside the prompt window but are
+    # still in the (larger) DB buffer — one bulk fetch, only when needed.
+    missing = {m["reply_to"] for m in history
+               if m.get("reply_to") and m["reply_to"] not in msg_map}
+    if missing:
+        try:
+            fetched = await asyncio.to_thread(
+                mem_store.get_messages_by_ids, channel_id, missing)
+        except Exception:
+            log.exception("reply parent backfill failed")
+            fetched = {}
+        for pid, row in fetched.items():
+            msg_map[pid] = {
+                "id": row["msg_id"],
+                "author": row.get("author_name", "?"),
+                "author_id": row.get("author_id", ""),
+                "role": row.get("role", "user"),
+                "content": row.get("content", ""),
+                "reply_to": row.get("reply_to"),
+                "attachments": row.get("attachments") or [],
+            }
+
     for m in history:
-
-        text = f"{m['author']}: {m['content']}"
-
-        markers = mem_vision.format_markers(m.get("attachments"))
-        if markers:
-            text += markers
-
-        if m.get("reply_to"):
-            parent = msg_map.get(m["reply_to"])
-
-            if parent:
-                text = (
-                    f"{m['author']} "
-                    f"(replying to {parent['author']}: {parent['content']}): "
-                    f"{m['content']}"
-                )
-
-        prompt += text + "\n"
+        prompt += mem_buffer.format_history_line(
+            m, msg_map.get(m["reply_to"]) if m.get("reply_to") else None) + "\n"
 
     prompt += f"\nPrompt:\n{username}: {user_message}\n{ASSISTANT_NAME}:"
 

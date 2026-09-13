@@ -179,6 +179,42 @@ def get_message_count(channel_id):
         con.close()
 
 
+def get_messages_by_ids(channel_id, ids):
+    """Bulk-fetch messages by id. Returns {msg_id: row dict}.
+
+    Used to recover reply parents that fell outside the prompt window.
+    Empty input short-circuits without touching the DB.
+    """
+    want = set()
+    for i in ids or []:
+        try:
+            want.add(int(i))
+        except (TypeError, ValueError):
+            continue
+    if not want:
+        return {}
+    q = ",".join("?" for _ in want)
+    con = _connect()
+    try:
+        rows = con.execute(
+            f"""SELECT msg_id, author_id, author_name, role,
+                       content, reply_to, created_at, attachments
+                FROM messages WHERE channel_id=? AND msg_id IN ({q})""",
+            (str(channel_id), *want),
+        ).fetchall()
+    finally:
+        con.close()
+    out = {}
+    for r in rows:
+        d = dict(r)
+        try:
+            d["attachments"] = json.loads(d.get("attachments") or "[]")
+        except Exception:
+            d["attachments"] = []
+        out[d["msg_id"]] = d
+    return out
+
+
 def get_max_msg_id(channel_id):
     con = _connect()
     try:

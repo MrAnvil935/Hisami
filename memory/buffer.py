@@ -1,6 +1,10 @@
 """Short-term buffer helpers: token-aware window over SQLite history."""
 
 from . import store
+from . import vision as mem_vision
+
+PARENT_TRUNCATE_CHARS = 300
+STALE_REPLY_MARKER = "replying to an older message outside current context"
 
 
 def estimate_tokens(text: str) -> int:
@@ -34,3 +38,36 @@ def load_window(channel_id, budget_tokens=1500, max_messages=30, fetch_limit=120
         used += t
     picked.reverse()
     return picked
+
+
+def format_history_line(msg, parent=None):
+    """Render one window message for the prompt (legacy compat shape).
+
+    - plain message: 'author: content [markers]'
+    - reply with resolvable parent: 'author (replying to X: Y): content [markers]'
+    - reply with missing parent: 'author (replying to an older message
+      outside current context): content [markers]' — honest about the gap
+      instead of silently flattening the reply into a standalone statement.
+
+    Parent content is truncated (auxiliary context, not primary).
+    Media markers are always preserved. Pure function (no I/O).
+    """
+    markers = mem_vision.format_markers(msg.get("attachments"))
+    text = f"{msg.get('author', '?')}: {msg.get('content', '')}"
+    if msg.get("reply_to"):
+        if parent is not None:
+            ptext = str(parent.get("content", ""))[:PARENT_TRUNCATE_CHARS]
+            text = (
+                f"{msg.get('author', '?')} "
+                f"(replying to {parent.get('author', '?')}: {ptext}): "
+                f"{msg.get('content', '')}"
+            )
+        else:
+            text = (
+                f"{msg.get('author', '?')} "
+                f"({STALE_REPLY_MARKER}): "
+                f"{msg.get('content', '')}"
+            )
+    if markers:
+        text += markers
+    return text

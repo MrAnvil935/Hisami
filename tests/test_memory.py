@@ -68,6 +68,19 @@ class StoreTest(TempDBMixin, unittest.TestCase):
         rows = mem_store.get_recent("c9", 5)
         self.assertEqual(rows[0]["author_id"], "u1")
 
+    def test_get_messages_by_ids(self):
+        mem_store.add_message("cb", 1, "u1", "alice", "user", "first")
+        mem_store.add_message("cb", 2, "u2", "bob", "user", "second",
+                              attachments=[{"kind": "video", "name": "v.mp4"}])
+        got = mem_store.get_messages_by_ids("cb", [1, 2, 999])
+        self.assertEqual(set(got), {1, 2})
+        self.assertEqual(got[1]["author_name"], "alice")
+        self.assertEqual(got[2]["attachments"],
+                         [{"kind": "video", "name": "v.mp4"}])
+        # channel isolation + empty input
+        self.assertEqual(mem_store.get_messages_by_ids("other", [1]), {})
+        self.assertEqual(mem_store.get_messages_by_ids("cb", []), {})
+
     def test_clear_recent_keeps_summaries_and_facts(self):
         self._seed(n=10)
         mem_store.add_summary("c1", "talked about minecraft", 1, 5)
@@ -133,6 +146,41 @@ class BufferTest(TempDBMixin, unittest.TestCase):
         # tiny budget must trim to a few newest messages
         self.assertTrue(1 <= len(window) <= 5)
         self.assertEqual(window[-1]["msg_id"], 20)
+
+    def test_format_plain(self):
+        self.assertEqual(
+            mem_buffer.format_history_line(
+                {"author": "a", "content": "hi"}, None),
+            "a: hi")
+
+    def test_format_reply(self):
+        parent = {"author": "bob", "content": "is this real?"}
+        self.assertEqual(
+            mem_buffer.format_history_line(
+                {"author": "a", "content": "yes", "reply_to": 5}, parent),
+            "a (replying to bob: is this real?): yes")
+
+    def test_format_reply_truncates_parent(self):
+        parent = {"author": "bob", "content": "x" * 900}
+        out = mem_buffer.format_history_line(
+            {"author": "a", "content": "yes", "reply_to": 5}, parent)
+        self.assertIn("x" * 300, out)
+        self.assertNotIn("x" * 301, out)
+
+    def test_format_missing_parent(self):
+        out = mem_buffer.format_history_line(
+            {"author": "a", "content": "yes", "reply_to": 999}, None)
+        self.assertIn("outside current context", out)
+        self.assertTrue(out.startswith("a (replying"))
+        self.assertTrue(out.endswith("yes"))
+
+    def test_format_markers_preserved_on_reply(self):
+        parent = {"author": "bob", "content": "look"}
+        out = mem_buffer.format_history_line(
+            {"author": "a", "content": "nice", "reply_to": 5,
+             "attachments": [{"kind": "image", "name": "p.png"}]}, parent)
+        self.assertIn("[image: p.png]", out)
+        self.assertIn("replying to bob", out)
 
 
 class RecallTest(TempDBMixin, unittest.TestCase):
