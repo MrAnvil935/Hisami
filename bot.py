@@ -895,15 +895,16 @@ async def startup_model_check():
                 "degraded until it runs (ollama serve)")
             return
 
-        # embedding model always ensured while the server is up
-        if not model_is_resident(EMBED_MODEL, loaded):
-            log.info("[ollama] preloading embedding model (%s)", EMBED_MODEL)
-            if await asyncio.to_thread(preload_model, EMBED_MODEL):
-                log.info("[ollama] embedding model ready")
-                loaded = await asyncio.to_thread(get_loaded_models) or loaded
-            else:
-                log.warning("[ollama] embedding model missing — "
-                            "run: ollama pull %s", EMBED_MODEL)
+        # Embedding model always ensured while the server is up. Note this
+        # deliberately does NOT use /api/ps + /api/chat like the generation
+        # models below: /api/ps omits pulled-but-unloaded models, and
+        # embedding models reject /api/chat. A trivial /api/embed call both
+        # probes presence and warms the model in one shot.
+        if await asyncio.to_thread(is_embed_model_available):
+            log.info("[ollama] embedding model ready")
+        else:
+            log.warning("[ollama] embedding model missing — "
+                        "run: ollama pull %s", EMBED_MODEL)
 
         gen_models = []
         for label, name in (("chat", OLLAMA_MODEL),
