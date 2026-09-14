@@ -1907,14 +1907,14 @@ async def status(interaction: discord.Interaction):
         f"- Ollama: {SUMMARY_OLLAMA_MODEL} | {'🟢 Loaded' if summary_loaded else '🔴 Not loaded'}\n"
         f"- OpenRouter: {SUMMARY_MODEL}\n\n"
 
-        f"**Vision model**\n"
+        f"**Vision**\n"
         f"- Ollama: {VISION_OLLAMA_MODEL} | {'🟢 Loaded' if vision_loaded else '🔴 Not loaded'}\n"
         f"- OpenRouter: {VISION_MODEL}\n\n"
 
         f"**Stats**\n"
         f"- Ping: {ping} ms\n"
         f"- Uptime: {format_uptime()}\n"
-        f"- HNSW index: {len(indexed_texts)} | {'🟢 Loaded' if index is not None else '🔴 Missing'} | entries\n"
+        f"- HNSW index: {len(indexed_texts)} entries | {'🟢 Loaded' if index is not None else '🔴 Missing'}\n"
         f"- Random images: {image_count}\n\n"
 
         f"**Conversation memory (this channel)**\n"
