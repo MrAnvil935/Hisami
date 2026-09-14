@@ -839,12 +839,12 @@ def is_ollama_model_loaded(model_name=None):
         return False
 
 
-def is_embed_model_available():
+def is_embed_model_available(timeout=3):
     try:
         r = http.post(
             f"{OLLAMA_BASE}/api/embed",
             json={"model": EMBED_MODEL, "input": "test"},
-            timeout=3,
+            timeout=timeout,
         )
         return r.status_code == 200
     except Exception:
@@ -899,8 +899,10 @@ async def startup_model_check():
         # deliberately does NOT use /api/ps + /api/chat like the generation
         # models below: /api/ps omits pulled-but-unloaded models, and
         # embedding models reject /api/chat. A trivial /api/embed call both
-        # probes presence and warms the model in one shot.
-        if await asyncio.to_thread(is_embed_model_available):
+        # probes presence and warms the model in one shot. Generous timeout:
+        # a cold model load on slow hardware can take well over a few
+        # seconds, and this runs once per boot in the background.
+        if await asyncio.to_thread(is_embed_model_available, 60):
             log.info("[ollama] embedding model ready")
         else:
             log.warning("[ollama] embedding model missing — "
