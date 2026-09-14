@@ -20,6 +20,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from memory import buffer as mem_buffer
+from memory import config as mem_config
 from memory import examples as mem_examples
 from memory import facts as mem_facts
 from memory import llmlog as mem_llmlog
@@ -49,8 +50,8 @@ VALID_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 # CONFIG
 # ============================================================
 
-with open("config.json", "r", encoding="utf-8") as f:
-    config = json.load(f)
+# JSONC: // and /* */ comments allowed (see memory/config.py)
+config = mem_config.load_config("config.json")
 
 # You can change those in config
 
@@ -71,6 +72,7 @@ OLLAMA_URL = config["ollama_url"]
 OLLAMA_MODEL = config["ollama_model"]
 MAX_OLLAMA_TOKENS = config["ollama_max_tokens"]
 OLLAMA_TIMEOUT = config["ollama_timeout"]
+OLLAMA_AUTOLOAD = config.get("ollama_autoload", False)
 
 BOTNAME = config["botname"]
 
@@ -847,6 +849,95 @@ def is_embed_model_available():
         return r.status_code == 200
     except Exception:
         return False
+
+
+def get_loaded_models():
+    """Names of models currently resident in Ollama, or None if down."""
+    try:
+        r = http.get(f"{OLLAMA_BASE}/api/ps", timeout=2)
+        r.raise_for_status()
+        return {str(m.get("name", "")) for m in r.json().get("models", [])}
+    except Exception:
+        return None
+
+
+def model_is_resident(model, loaded):
+    return any(name.startswith(model) for name in loaded)
+
+
+def preload_model(model):
+    """Blocking: load `model` via a minimal chat call. Returns bool."""
+    try:
+        r = http.post(
+            OLLAMA_URL,
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "options": {"num_predict": 1},
+                "stream": False,
+                "keep_alive": "30m",
+            },
+            timeout=OLLAMA_TIMEOUT,
+        )
+        return r.status_code == 200
+    except Exception as e:
+        log.warning("preload %s failed: %s", model, e)
+        return False
+
+
+async def startup_model_check():
+    """Once-per-boot Ollama report + optional autoload. Never raises."""
+    try:
+        loaded = await asyncio.to_thread(get_loaded_models)
+        if loaded is None:
+            log.warning(
+                "[ollama] server unreachable — local chains and embeddings "
+                "degraded until it runs (ollama serve)")
+            return
+
+        # embedding model always ensured while the server is up
+        if not model_is_resident(EMBED_MODEL, loaded):
+            log.info("[ollama] preloading embedding model (%s)", EMBED_MODEL)
+            if await asyncio.to_thread(preload_model, EMBED_MODEL):
+                log.info("[ollama] embedding model ready")
+                loaded = await asyncio.to_thread(get_loaded_models) or loaded
+            else:
+                log.warning("[ollama] embedding model missing — "
+                            "run: ollama pull %s", EMBED_MODEL)
+
+        gen_models = []
+        for label, name in (("chat", OLLAMA_MODEL),
+                            ("summary", SUMMARY_OLLAMA_MODEL),
+                            ("vision", VISION_OLLAMA_MODEL)):
+            if name not in [m for _, m in gen_models]:
+                gen_models.append((label, name))
+
+        missing = [f"{label} ({name})" for label, name in gen_models
+                   if not model_is_resident(name, loaded)]
+
+        if not missing:
+            return
+
+        if OLLAMA_AUTOLOAD:
+            for label, name in gen_models:
+                if model_is_resident(
+                        name, await asyncio.to_thread(get_loaded_models) or set()):
+                    continue
+                log.info("[ollama] autoloading %s model (%s)", label, name)
+                if await asyncio.to_thread(preload_model, name):
+                    log.info("[ollama] %s model ready", label)
+                else:
+                    log.warning("[ollama] %s model (%s) failed to load — "
+                                "run: ollama pull %s", label, name, name)
+            return
+
+        log.info(
+            "[ollama] models in config but not loaded: %s. "
+            "Set ollama_autoload: true in config.json to preload them "
+            "at startup (default false to avoid surprise VRAM use).",
+            ", ".join(missing))
+    except Exception:
+        log.exception("[ollama] startup model check failed")
 
 
 async def ollama_chat(messages, model=None, temperature=0.9,
@@ -2112,6 +2203,11 @@ async def on_ready():
     if not hasattr(client, "memory_task"):
         client.memory_task = asyncio.create_task(
             memory_maintenance_loop()
+        )
+
+    if not hasattr(client, "model_check_task"):
+        client.model_check_task = asyncio.create_task(
+            startup_model_check()
         )
 
     log.info("Logged in as %s", client.user)

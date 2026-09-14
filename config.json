@@ -1,73 +1,179 @@
 {
+  // This file is JSONC: // and /* */ comments are allowed (see memory/config.py).
+  // Replace the two placeholder tokens below with real ones. Never commit
+  // real tokens — keep them in a local copy only.
+
+  // Discord bot token (Discord Developer Portal -> Bot -> Token).
   "discord_token": "Put discord token here",
+  // OpenRouter API key, used for main chat fallback, summaries, and vision
+  // fallback when the matching local Ollama model is not loaded.
   "openrouter_api_key": "Put openrouter key here",
+
+  // Primary chat model (OpenRouter). Used when the local ollama_model
+  // below is not loaded.
   "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+  // Last-resort chat model when the primary fails. Replies are tagged
+  // with the model name so you can tell the fallback fired.
   "fallback_model": "openrouter/free",
+
+  // Ollama chat endpoint (OpenAI-compatible /api/chat).
   "ollama_url": "http://localhost:11434/api/chat",
+  // Local chat model. Used FIRST whenever it is already loaded in Ollama;
+  // the bot never loads it on its own (see ollama_autoload).
   "ollama_model": "gemma4:12b",
+  // Context window passed to the local chat model.
   "ollama_max_tokens": 10000,
+  // Seconds per local chat request before giving up.
   "ollama_timeout": 240,
+  // Preload Ollama models at startup. Default false: loading a 12b +
+  // vision + embed stack can exceed VRAM unasked. The embedding model
+  // preloads whenever the server is up regardless of this flag.
+  "ollama_autoload": false,
+
+  // SQLite file holding messages, summaries, facts, and image cache.
+  // Survives restarts. Gitignored — never commit it.
   "memory_db_path": "memory.db",
+  // Recent-message window injected per reply. Token budget (below) and
+  // message-count cap (next key) apply together; larger = more context
+  // but bigger prompts.
   "memory_buffer_tokens": 1500,
   "memory_buffer_max_msgs": 30,
+  // Messages per channel summarized into one long-term summary chunk.
   "memory_summary_chunk": 30,
+  // Channels with no bot mention in the last N messages skip background
+  // summarization until mentioned again (DMs always qualify).
   "memory_engage_lookback": 30,
+  // Summarize early when the unsummarized backlog passes this many tokens,
+  // even below memory_summary_chunk (long messages bloat the raw window).
   "memory_summary_chunk_tokens": 3000,
+  // ...but never summarize fewer than this many messages at once.
   "memory_summary_min_msgs": 10,
+  // Master switch for per-user fact extraction (live mention path excluded;
+  // batched chunk extraction only). Facts of the author + peers inject.
   "memory_facts_enabled": true,
+  // Master switch for FTS5 keyword recall over past messages.
   "memory_recall_enabled": true,
+  // Past messages injected per reply (keyword-ranked).
   "memory_recall_limit": 3,
+  // Other users (mentioned/named/recent) whose facts also inject, ...
   "memory_peer_max_users": 2,
+  // ...with at most this many facts each.
   "memory_peer_max_facts": 3,
+  // Per-user cooldown between bot replies (seconds). Replies inside the
+  // window get a "slow down" nudge instead of a generation.
   "cooldown_seconds": 5,
+  // Raw messages kept per channel in the DB (older pruned; summaries keep
+  // the knowledge). Keep above memory_summary_chunk so the background
+  // loop never loses unsummarized messages.
   "memory_prune_keep": 60,
+
+  // Local summarizer model (channel summaries + fact extraction).
+  // Tried first when loaded; OpenRouter summary_model is last resort.
   "summary_ollama_model": "gemma3n:e4b",
   "summary_model": "nex-agi/nex-n2.5-mini:free",
+  // Low temperature: summaries/facts must be deterministic, not creative.
   "summary_temperature": 0.2,
+  // Max tokens per summary/fact call. Raise on length-related failures.
   "summary_max_tokens": 800,
+  // Seconds per local summary request.
   "summary_ollama_timeout": 60,
+  // Seconds per OpenRouter summary request.
   "summary_timeout": 60,
+  // OpenRouter retries for background jobs (1: fail-soft, retry next cycle).
   "summary_max_retries": 1,
+  // Seconds between background summarizer sweeps over channels.
   "summary_interval": 300,
+  // Context window for the local summarizer model.
   "summary_ollama_ctx": 2048,
+
+  // Local vision model for image descriptions. Must be vision-capable
+  // (text-only models return nothing useful). OpenRouter vision_model
+  // below is the last resort. Only the FIRST image per ping is described.
   "vision_ollama_model": "qwen2.5vl:3b",
   "vision_model": "openrouter/free",
+  // Low temperature: descriptions must be factual, not creative.
   "vision_temperature": 0.2,
+  // Max tokens per description. Reasoning models spend output tokens on
+  // thinking, so raise on length-related failures.
   "vision_max_tokens": 1200,
+  // Seconds per vision request (download + describe).
   "vision_timeout": 90,
+  // Largest downloadable image in bytes (10 MB). Bigger skipped silently.
   "vision_max_bytes": 10485760,
+  // Days a cached image description stays valid (re-described after).
   "vision_cache_ttl_days": 7,
+  // Max cached descriptions (oldest evicted first).
   "vision_cache_max": 200,
+
+  // Static persona blurb injected before style examples. Generate with
+  // style_profile.py, then hand-edit. Missing/empty = generic fallback lines.
   "style_profile_path": "style_profile.txt",
+  // Master switch for the style-profile block.
   "style_profile_enabled": true,
+  // Hard cap so a long hand-edited profile can't blow the prompt.
   "style_profile_max_chars": 2000,
+
+  // Directory for debug logs (gitignored; prompts contain conversation text).
   "log_dir": "logs",
+  // File-log verbosity. Terminal always stays at INFO (concise); full
+  // bodies live in logs/bot.log + logs/llm.jsonl regardless.
   "log_file_level": "DEBUG",
+  // logs/bot.log rotation: this many bytes per file...
   "log_max_bytes": 5242880,
+  // ...keeping this many backups.
   "log_backups": 3,
+  // Per-call full request/response dump to logs/llm.jsonl (headers and
+  // image bytes redacted). Set false to keep only bot.log.
   "llm_dump_enabled": true,
+
+  // Recent messages /lobotomy forgets (unsticks looping models).
+  // Summaries and facts are intentionally preserved.
   "max_history": 30,
+  // Style examples retrieved per reply (best-ranked kept first).
   "max_examples": 20,
+  // ...within this token budget (huge examples can't blow the prompt).
   "examples_max_tokens": 3000,
+
+  // Display name used in /status.
   "botname": "Hisami",
+  // /clearmemory command (clears recent buffer).
   "clear_command_name": "clearmemory",
   "clear_command_description":"Removes recent messages from bot's memory",
   "clear_command_text": "Done",
+  // /randomimage command (DMs a random file from images/).
   "randomimage_command_name": "randomimage",
   "randomimage_command_description": "Sends you a random image",
   "randomimage_command_text": "Check your dms",
+  // /status command (models, memory, uptime).
   "status_command_name": "status",
   "status_command_description": "Shows bot status.",
+  // /prompt command (direct LLM chat with optional web search).
   "prompt_command_name": "prompt",
   "prompt_command_description": "Interact with the LLM directly",
+  // /web command (raw web results, no AI involved).
   "web_command_name": "web",
   "web_command_description": "Search the web, no AI involved",
+
+  // System prompt for /prompt (deliberately NOT the Hisami persona).
   "prompt_system": "You are a helpful assistant.",
+
+  // Master switch for DuckDuckGo search in mention replies.
   "search_enabled": true,
+  // Results injected per reply (more = more context, more tokens).
   "search_max_results": 4,
+  // Short follow-ups (<= N words) get the previous message prepended
+  // so "is that real?" searches with its subject.
   "search_short_message_words": 5,
+  // Seconds per search request (x search_max_retries worst case).
   "search_timeout": 15,
+  // Transport-failure retries per search (bot-blocks are NOT retried).
   "search_max_retries": 3,
+  // Substring triggers: any of these in a message fires a web search.
+  // Broad entries ("what", "how") multiply request volume and DDG
+  // rate-limiting (HTTP 104 resets) — keep narrow if searches fail.
   "search_triggers": ["?", "latest", "news", "today", "what is", "price"],
+
+  // Persona-defining system prompt for mention replies. This is what
+  // makes the bot roleplay instead of answering as an assistant.
   "master_prompt": "You are discord bot roleplaying as a Discord user. Keep responses natural, short, and informal."
 }

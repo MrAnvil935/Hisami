@@ -14,6 +14,7 @@ import unittest
 
 import style_profile
 from memory import buffer as mem_buffer
+from memory import config as mem_config
 from memory import examples as mem_examples
 from memory import facts as mem_facts
 from memory import llmlog as mem_llmlog
@@ -600,6 +601,35 @@ class VisionStoreTest(TempDBMixin, unittest.TestCase):
             mem_store.get_image_desc("k1", ttl_seconds=60), "a cat")
         self.assertEqual(
             mem_store.get_image_desc("k1", ttl_seconds=-1), "")
+
+
+class ConfigTest(unittest.TestCase):
+    def test_strip_line_comments(self):
+        text = '{\n// full line comment\n"a": 1 // trailing\n}'
+        self.assertEqual(mem_config.strip_json_comments(text),
+                         '{\n\n"a": 1 \n}')
+
+    def test_strip_block_comments(self):
+        text = '{"a": /* inline */ 1, /* multi\nline */ "b": 2}'
+        self.assertEqual(json.loads(mem_config.strip_json_comments(text)),
+                         {"a": 1, "b": 2})
+
+    def test_urls_and_escapes_untouched(self):
+        text = ('{"url": "http://localhost:11434/api/chat",\n'
+                '"q": "a // not comment /* nor this",\n'
+                '"e": "quote \\" // still string"}')
+        parsed = json.loads(mem_config.strip_json_comments(text))
+        self.assertEqual(parsed["url"], "http://localhost:11434/api/chat")
+        self.assertEqual(parsed["q"], "a // not comment /* nor this")
+        self.assertEqual(parsed["e"], 'quote " // still string')
+
+    def test_load_real_config(self):
+        if not os.path.exists("config.json"):
+            self.skipTest("run from project root")
+        cfg = mem_config.load_config("config.json")
+        for key in ("discord_token", "model", "ollama_model",
+                    "memory_db_path", "summary_model", "vision_model"):
+            self.assertIn(key, cfg)
 
 
 if __name__ == "__main__":

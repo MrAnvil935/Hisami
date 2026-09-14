@@ -83,7 +83,8 @@ These files are required by the bot.
 
 ### 3. Configure the bot
 
-Edit `config.json`.
+Edit `config.json` (JSONC — `//` and `/* */` comments allowed, every key
+documented inline).
 
 At minimum you'll need:
 
@@ -93,6 +94,11 @@ At minimum you'll need:
 Tunable groups (all have built-in defaults, see `config.json`):
 
 * `model` / `fallback_model` — main chat chain (local Ollama first, then OpenRouter)
+* `ollama_autoload` — preload Ollama models at startup (default `false`;
+  a 12b + vision + embed load can exceed VRAM unasked). The embedding model
+  preloads whenever the server is up regardless of this flag; generation
+  models only with it on. With it off, startup logs one block naming
+  configured-but-unloaded models and how to enable preloading.
 * `summary_ollama_model` / `summary_model` — background chain for memory
   summarization and fact extraction (local first, OpenRouter last resort)
 * `vision_ollama_model` / `vision_model` — image description chain

@@ -1,27 +1,6 @@
 """One-shot static style-profile generator (manual use only).
 
 Samples Target Responses from texts.json, distills them into a persona
-profile via the LOCAL summary Ollama model, and writes style_profile.txt
-for human review/editing. Never touches OpenRouter and never runs inside
-the bot — re-run deliberately (e.g. after re-embedding a new corpus).
-
-Usage:
-    venv/bin/python style_profile.py [--samples 60] [--seed 2]
-                                      [--out style_profile.txt]
-"""
-
-import argparse
-import json
-import sys
-
-import requests
-
-from memory import styleprofile as sp
-
-
-"""One-shot static style-profile generator (manual use only).
-
-Samples Target Responses from texts.json, distills them into a persona
 profile via the LOCAL summary Ollama model (OpenRouter summary model as
 fallback), and writes style_profile.txt for human review/editing. Never
 runs inside the bot — re-run deliberately (e.g. after re-embedding a new
@@ -40,14 +19,14 @@ import time
 
 import requests
 
+from memory import config as mem_config
 from memory import styleprofile as sp
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def load_config():
-    with open("config.json", "r", encoding="utf-8") as f:
-        return json.load(f)
+    return mem_config.load_config("config.json")
 
 
 def build_messages(samples):
