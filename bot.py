@@ -1892,43 +1892,30 @@ async def status(interaction: discord.Interaction):
     text = (
         f"## {BOTNAME} status\n\n"
 
-        f"**Ollama model**\n"
-        f"- {OLLAMA_MODEL}\n"
-        f"- {'🟢 Loaded' if ollama_loaded else '🔴 Not loaded'}\n\n"
+        f"**Embedding**\n"
+        f"- {EMBED_MODEL} | {'🟢 Reachable' if embed_available else '🔴 Offline'}\n\n"
 
-        f"**Embedding model**\n"
-        f"- {EMBED_MODEL}\n"
-        f"- {'🟢 Reachable' if embed_available else '🔴 Offline'}\n\n"
+        f"**Ollama**\n"
+        f"- {OLLAMA_MODEL} | {'🟢 Loaded' if ollama_loaded else '🔴 Not loaded'}\n\n"
 
-        f"**OpenRouter main**\n"
-        f"- {MODEL}\n\n"
-
-        f"**OpenRouter fallback**\n"
-        f"- {FALLBACK_MODEL}\n"
+        f"**OpenRouter**\n"
+        f"- Main: {MODEL}\n"
+        f"- Fallback: {FALLBACK_MODEL}\n"
         f"- failures this session: {_openrouter_failures}\n\n"
     
         f"**Summarizer**\n"
-        f"- Ollama: {SUMMARY_OLLAMA_MODEL}\n"
-        f"- {'🟢 Loaded' if summary_loaded else '🔴 Not loaded'}\n"
+        f"- Ollama: {SUMMARY_OLLAMA_MODEL} | {'🟢 Loaded' if summary_loaded else '🔴 Not loaded'}\n"
         f"- OpenRouter: {SUMMARY_MODEL}\n\n"
 
-        f"**Image model**\n"
-        f"- Ollama: {VISION_OLLAMA_MODEL}\n"
-        f"- {'🟢 Loaded' if vision_loaded else '🔴 Not loaded'}\n"
+        f"**Vision model**\n"
+        f"- Ollama: {VISION_OLLAMA_MODEL} | {'🟢 Loaded' if vision_loaded else '🔴 Not loaded'}\n"
         f"- OpenRouter: {VISION_MODEL}\n\n"
 
-        f"**HNSW index**\n"
-        f"- {'🟢 Loaded' if index is not None else '🔴 Missing'}\n"
-        f"- {len(indexed_texts)} entries\n\n"
-
-        f"**Ping**\n"
-        f"- {ping} ms\n\n"
-
-        f"**Uptime**\n"
-        f"- {format_uptime()}\n\n"
-
-        f"**Random images**\n"
-        f"- {image_count}\n\n"
+        f"**Stats**\n"
+        f"- Ping: {ping} ms\n"
+        f"- Uptime: {format_uptime()}\n"
+        f"- HNSW index: {len(indexed_texts)} | {'🟢 Loaded' if index is not None else '🔴 Missing'} | entries\n"
+        f"- Random images: {image_count}\n\n"
 
         f"**Conversation memory (this channel)**\n"
         f"- {mem['messages']} buffered\n"
