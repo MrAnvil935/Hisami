@@ -87,6 +87,7 @@ MEMORY_SUMMARY_MIN_MSGS = config.get("memory_summary_min_msgs", 10)
 MEMORY_FACTS_ENABLED = config.get("memory_facts_enabled", True)
 MEMORY_RECALL_ENABLED = config.get("memory_recall_enabled", True)
 MEMORY_RECALL_LIMIT = config.get("memory_recall_limit", 3)
+MEMORY_SEMANTIC_RANK = config.get("memory_semantic_rank", True)
 MEMORY_PEER_MAX_USERS = config.get("memory_peer_max_users", 2)
 MEMORY_PEER_MAX_FACTS = config.get("memory_peer_max_facts", 3)
 COOLDOWN_SECONDS = config.get("cooldown_seconds", 5)
@@ -313,6 +314,19 @@ def get_embedding(text):
     )
     res.raise_for_status()
     return res.json()["embeddings"][0]
+
+
+def embed_vector(text):
+    """Blocking: text -> float32 np array (DIM) for semantic ranking.
+
+    Returns None when Ollama is down or the shape is wrong — callers
+    fall back to keyword ranking. Use .tobytes() for DB storage.
+    """
+    try:
+        vec = np.array(get_embedding(text), dtype="float32")
+        return vec if vec.size == DIM else None
+    except Exception:
+        return None
 
 # ============================================================
 # RETRIEVAL
@@ -664,16 +678,24 @@ async def get_memory_context(channel_id, user_message, author_id=""):
     Runs SQLite lookups in threads; returns a formatted prompt section.
     Fail-soft: any error -> ''.
     """
+    query_vec = None
+    if MEMORY_SEMANTIC_RANK:
+        try:
+            query_vec = await asyncio.to_thread(embed_vector, user_message)
+        except Exception:
+            log.exception("memory query embed failed")
+            query_vec = None
     try:
         summaries, recalled, facts, recent = await asyncio.gather(
             asyncio.to_thread(
-                mem_store.search_summaries, channel_id, user_message, 2),
+                mem_store.search_summaries, channel_id, user_message, 2,
+                query_vec),
             asyncio.to_thread(
                 mem_recall.search_messages, channel_id, user_message,
                 MEMORY_RECALL_LIMIT) if MEMORY_RECALL_ENABLED
             else asyncio.sleep(0, result=[]),
             asyncio.to_thread(
-                mem_store.get_facts, author_id, 5, user_message)
+                mem_store.get_facts, author_id, 5, user_message, query_vec)
             if (MEMORY_FACTS_ENABLED and author_id) else asyncio.sleep(0, result=[]),
             asyncio.to_thread(
                 mem_store.get_recent, channel_id, 15)
@@ -708,7 +730,7 @@ async def get_memory_context(channel_id, user_message, author_id=""):
                 peer_facts = await asyncio.gather(*[
                     asyncio.to_thread(
                         mem_store.get_facts, uid, MEMORY_PEER_MAX_FACTS,
-                        user_message)
+                        user_message, query_vec)
                     for uid in peer_ids
                 ])
                 for uid, pf in zip(peer_ids, peer_facts):
@@ -1786,9 +1808,17 @@ async def summarize_channel(channel_id):
         if not summary_text:
             return False
         msg_ids = [m["msg_id"] for m in chunk]
+        summary_vec = None
+        if MEMORY_SEMANTIC_RANK:
+            try:
+                summary_vec = await asyncio.to_thread(
+                    embed_vector, summary_text)
+            except Exception:
+                log.exception("summary embed failed")
         await asyncio.to_thread(
             mem_store.add_summary, channel_id, summary_text,
-            min(msg_ids), max(msg_ids))
+            min(msg_ids), max(msg_ids),
+            summary_vec.tobytes() if summary_vec is not None else None)
         await asyncio.to_thread(
             mem_store.set_last_summary_upto, channel_id, max(msg_ids))
         log.info("[memory] summarized %d msgs in channel %s",
@@ -1840,13 +1870,60 @@ async def extract_chunk_facts(channel_id, chunk):
                 continue
             _last_fact_run[uid] = now
             for fact in facts:
+                fact_vec = None
+                if MEMORY_SEMANTIC_RANK:
+                    try:
+                        fact_vec = await asyncio.to_thread(
+                            embed_vector, fact)
+                    except Exception:
+                        log.exception("fact embed failed")
                 ok = await asyncio.to_thread(
-                    mem_store.upsert_fact, uid, fact, 1.0)
+                    mem_store.upsert_fact, uid, fact, 1.0,
+                    fact_vec.tobytes() if fact_vec is not None else None)
                 saved += 1 if ok else 0
         log.info("[memory] chunk facts: %d saved for %d speaker(s) in %s",
                  saved, len(parsed), channel_id)
     except Exception:
         log.exception("[memory] chunk fact extraction failed")
+
+
+async def backfill_embeddings(limit=5):
+    """Embed pre-migration rows lacking vectors (bounded per cycle).
+
+    Runs inside the maintenance loop when semantic ranking is on, so
+    old summaries/facts migrate themselves within minutes of Ollama
+    being up. Fail-soft; Ollama down means zero work, not errors.
+    """
+    try:
+        work = [
+            ("summary", await asyncio.to_thread(
+                mem_store.get_unembedded_summaries, limit)),
+            ("fact", await asyncio.to_thread(
+                mem_store.get_unembedded_facts, limit)),
+        ]
+        for kind, rows in work:
+            for row in rows:
+                text = row.get("summary") if kind == "summary" else row.get("fact")
+                try:
+                    vec = await asyncio.to_thread(embed_vector, text or "")
+                except Exception:
+                    log.exception("[memory] backfill embed failed")
+                    return
+                if vec is None:
+                    return  # Ollama down: stop quietly, retry next cycle
+                if kind == "summary":
+                    await asyncio.to_thread(
+                        mem_store.set_summary_embedding,
+                        row["chunk_id"], vec.tobytes())
+                else:
+                    await asyncio.to_thread(
+                        mem_store.set_fact_embedding,
+                        row["user_id"], row["fact"], vec.tobytes())
+        done = sum(len(rows) for _, rows in work)
+        if done:
+            log.info("[memory] backfilled %d embeddings", done)
+    except Exception:
+        log.exception("[memory] embedding backfill failed")
 
 
 async def memory_maintenance_loop():
@@ -1856,6 +1933,8 @@ async def memory_maintenance_loop():
     while not client.is_closed():
         try:
             bot_id = str(client.user.id) if client.user else ""
+            if MEMORY_SEMANTIC_RANK:
+                await backfill_embeddings()
             # discover channels from recent guilds to avoid unbounded growth
             for guild in client.guilds:
                 for ch in guild.text_channels:

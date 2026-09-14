@@ -104,6 +104,56 @@ class StoreTest(TempDBMixin, unittest.TestCase):
                   for f in mem_store.get_facts("uq", 3, query="minecraft?")]
         self.assertEqual(ranked[0], "plays minecraft daily")
 
+    def test_pool_reaches_beyond_20(self):
+        # oldest fact sits past the old 20-row pool cutoff: ranking must
+        # still surface it when topical (regression test for pool width)
+        mem_store.upsert_fact("uw", "ancient pottery techniques")
+        for i in range(24):
+            mem_store.upsert_fact("uw", f"filler hobby number {i}")
+        ranked = [f["fact"] for f in mem_store.get_facts(
+            "uw", 3, query="pottery kiln")]
+        self.assertEqual(ranked[0], "ancient pottery techniques")
+
+    def test_fact_embedding_roundtrip(self):
+        import numpy as _np
+        vec = _np.array([0.25] * 8, dtype="float32")
+        mem_store.upsert_fact("ue", "loves stargazing", embedding=vec.tobytes())
+        rows = mem_store.get_facts("ue", 5)
+        self.assertEqual(len(rows), 1)
+        back = mem_recall.decode_embedding(rows[0]["embedding"], dim=8)
+        self.assertIsNotNone(back)
+        self.assertAlmostEqual(float(back[0]), 0.25)
+
+    def test_get_facts_hybrid_ranking(self):
+        import numpy as _np
+
+        def _vec(x, y):
+            v = _np.zeros(768, dtype="float32")
+            v[0], v[1] = x, y
+            return v
+
+        mem_store.upsert_fact(
+            "uh", "ancient pottery techniques",
+            embedding=_vec(1.0, 0.0).tobytes())
+        mem_store.upsert_fact(
+            "uh", "brand new hobby",
+            embedding=_vec(0.0, 1.0).tobytes())
+        # "ceramics kiln" shares no keywords: semantic path alone must win
+        ranked = [f["fact"] for f in mem_store.get_facts(
+            "uh", 5, query="ceramics kiln", query_vec=_vec(1.0, 0.05))]
+        self.assertEqual(ranked[0], "ancient pottery techniques")
+
+    def test_summary_embedding_roundtrip(self):
+        import numpy as _np
+        vec = _np.zeros(768, dtype="float32")
+        vec[0] = 0.75
+        q = _np.zeros(768, dtype="float32")
+        q[0] = 0.75
+        cid = mem_store.add_summary("cs", "talked about stars", 1, 5,
+                                    embedding=vec.tobytes())
+        found = mem_store.search_summaries("cs", "stars", query_vec=q)
+        self.assertTrue(any(s["chunk_id"] == cid for s in found))
+
     def test_summary_chunking(self):
         self._seed(n=39)
         self.assertEqual(mem_store.get_unsummarized("c1", 40), [])
@@ -209,6 +259,51 @@ class RecallTest(TempDBMixin, unittest.TestCase):
         self.assertEqual([r["fact"] for r in ranked],
                          ["likes hiking", "owns a farm", "plays minecraft daily"])
         self.assertEqual(mem_recall.rank_by_overlap(items, ""), ranked)
+
+    def test_cosine_sim(self):
+        self.assertAlmostEqual(
+            mem_recall.cosine_sim([1.0, 0.0], [1.0, 0.0]), 1.0)
+        self.assertAlmostEqual(
+            mem_recall.cosine_sim([1.0, 0.0], [0.0, 1.0]), 0.0)
+        self.assertEqual(mem_recall.cosine_sim([1.0], [1.0, 0.0]), 0.0)
+        self.assertEqual(mem_recall.cosine_sim(None, [1.0]), 0.0)
+        self.assertEqual(mem_recall.cosine_sim([0.0, 0.0], [1.0, 0.0]), 0.0)
+
+    def test_decode_embedding(self):
+        import numpy as _np
+        vec = _np.array([0.5, -0.25], dtype="float32")
+        back = mem_recall.decode_embedding(vec.tobytes(), dim=2)
+        self.assertIsNotNone(back)
+        self.assertAlmostEqual(float(back[0]), 0.5)
+        self.assertIsNone(mem_recall.decode_embedding(None))
+        self.assertIsNone(mem_recall.decode_embedding(b"junk", dim=2))
+        self.assertIsNone(
+            mem_recall.decode_embedding(vec.tobytes(), dim=7))
+
+    def test_rank_hybrid(self):
+        import numpy as _np
+
+        def _vec(x, y):
+            v = _np.zeros(768, dtype="float32")
+            v[0], v[1] = x, y
+            return v.tobytes()
+
+        items = [
+            {"fact": "likes hiking", "updated_at": 30,
+             "embedding": _vec(0.0, 1.0)},
+            {"fact": "unrelated old note", "updated_at": 5,
+             "embedding": _vec(1.0, 0.0)},
+            {"fact": "no vector here", "updated_at": 40,
+             "embedding": None},
+        ]
+        q = _np.zeros(768, dtype="float32")
+        q[0], q[1] = 1.0, 0.1
+        ranked = mem_recall.rank_hybrid(items, "zzz", q)
+        # semantic winner first despite oldest timestamp
+        self.assertEqual(ranked[0]["fact"], "unrelated old note")
+        # no vectors anywhere -> keyword/recency order preserved
+        ranked = mem_recall.rank_hybrid(items, "hiking", None)
+        self.assertEqual(ranked[0]["fact"], "likes hiking")
 
     def test_channel_engaged(self):
         msgs = [

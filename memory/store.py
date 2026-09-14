@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS summaries (
     summary    TEXT NOT NULL,
     msg_from   INTEGER NOT NULL DEFAULT 0,
     msg_to     INTEGER NOT NULL DEFAULT 0,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    embedding  BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_summaries_channel ON summaries(channel_id, chunk_id);
 
@@ -55,6 +56,7 @@ CREATE TABLE IF NOT EXISTS user_facts (
     fact       TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 1.0,
     updated_at REAL NOT NULL,
+    embedding  BLOB,
     PRIMARY KEY (user_id, fact)
 );
 
@@ -90,10 +92,14 @@ def init_db(path: str | None = None):
     con = _connect()
     try:
         con.executescript(SCHEMA)
-        # migrate pre-attachments databases in place
+        # migrate older databases in place
         cols = [r[1] for r in con.execute("PRAGMA table_info(messages)")]
         if "attachments" not in cols:
             con.execute("ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
+        for table in ("summaries", "user_facts"):
+            tcols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+            if "embedding" not in tcols:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN embedding BLOB")
         con.commit()
     finally:
         con.close()
@@ -287,13 +293,14 @@ def clear_recent(channel_id, limit=50):
 
 # ---------------- summaries ----------------
 
-def add_summary(channel_id, summary, msg_from=0, msg_to=0):
+def add_summary(channel_id, summary, msg_from=0, msg_to=0, embedding=None):
     con = _connect()
     try:
         cur = con.execute(
-            """INSERT INTO summaries (channel_id, summary, msg_from, msg_to, created_at)
-               VALUES (?,?,?,?,?)""",
-            (str(channel_id), str(summary), int(msg_from), int(msg_to), time.time()),
+            """INSERT INTO summaries (channel_id, summary, msg_from, msg_to, created_at, embedding)
+               VALUES (?,?,?,?,?,?)""",
+            (str(channel_id), str(summary), int(msg_from), int(msg_to), time.time(),
+             bytes(embedding) if embedding is not None else None),
         )
         con.commit()
         return cur.lastrowid
@@ -329,49 +336,76 @@ def get_summary_count(channel_id=None):
         con.close()
 
 
-def search_summaries(channel_id, query, limit=2):
-    """Keyword search over summaries with LIKE fallback (no extra deps)."""
-    from .recall import tokenize
+def search_summaries(channel_id, query, limit=2, query_vec=None):
+    """Keyword search over summaries, upgraded to hybrid when query_vec given.
+
+    Without a query vector this is the legacy LIKE scorer. With one,
+    candidates rank by semantic similarity + keyword boost (same weights
+    as style-example retrieval); rows lacking embeddings score keywords
+    only. Falls back to latest summaries when nothing matches.
+    """
+    from .recall import rank_hybrid, tokenize
 
     tokens = tokenize(query)[:6]
-    if not tokens:
+    if not tokens and query_vec is None:
         return get_latest_summaries(channel_id, limit)
     con = _connect()
     try:
         rows = con.execute(
-            "SELECT chunk_id, summary, msg_from, msg_to, created_at"
+            "SELECT chunk_id, summary, msg_from, msg_to, created_at, embedding"
             " FROM summaries WHERE channel_id=? ORDER BY chunk_id DESC LIMIT 200",
             (str(channel_id),),
         ).fetchall()
     finally:
         con.close()
-    scored = []
-    for r in rows:
-        text = r["summary"].lower()
-        score = sum(1 for t in tokens if t in text)
-        if score:
-            scored.append((score, r["chunk_id"], dict(r)))
-    scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
-    out = [s[2] for s in scored[:limit]]
-    if not out:
+    if query_vec is None:
+        scored = []
+        for r in rows:
+            text = r["summary"].lower()
+            score = sum(1 for t in tokens if t in text)
+            if score:
+                scored.append((score, r["chunk_id"], dict(r)))
+        scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+        out = [s[2] for s in scored[:limit]]
+        if not out:
+            return get_latest_summaries(channel_id, min(limit, 1))
+        return out
+    ranked = rank_hybrid(
+        [dict(r) for r in rows], query, query_vec,
+        text_key="summary", time_key="created_at", vec_key="embedding")
+    out = ranked[:limit]
+    if not any(_has_signal(r, query, query_vec) for r in out):
         return get_latest_summaries(channel_id, min(limit, 1))
     return out
 
 
+def _has_signal(row, query, query_vec, text_key="summary"):
+    from .recall import cosine_sim, decode_embedding, tokenize
+    # 0.1 clears random-vector noise (~N(0, 0.036) at 768 dims) while
+    # genuinely related texts typically score 0.3+.
+    if cosine_sim(query_vec, decode_embedding(row.get("embedding"))) > 0.1:
+        return True
+    tokens = tokenize(query)[:6]
+    text = str(row.get(text_key) or "").lower()
+    return any(t in text for t in tokens)
+
+
 # ---------------- user facts ----------------
 
-def upsert_fact(user_id, fact, confidence=1.0):
+def upsert_fact(user_id, fact, confidence=1.0, embedding=None):
     fact = str(fact).strip()
     if not fact or len(fact) > 500:
         return False
     con = _connect()
     try:
         con.execute(
-            """INSERT INTO user_facts (user_id, fact, confidence, updated_at)
-               VALUES (?,?,?,?)
+            """INSERT INTO user_facts (user_id, fact, confidence, updated_at, embedding)
+               VALUES (?,?,?,?,?)
                ON CONFLICT(user_id, fact) DO UPDATE SET
-                 confidence=excluded.confidence, updated_at=excluded.updated_at""",
-            (str(user_id), fact, float(confidence), time.time()),
+                 confidence=excluded.confidence, updated_at=excluded.updated_at,
+                 embedding=COALESCE(excluded.embedding, user_facts.embedding)""",
+            (str(user_id), fact, float(confidence), time.time(),
+             bytes(embedding) if embedding is not None else None),
         )
         con.commit()
         return True
@@ -379,9 +413,22 @@ def upsert_fact(user_id, fact, confidence=1.0):
         con.close()
 
 
-def get_facts(user_id, limit=5, query=None):
+def get_facts(user_id, limit=5, query=None, query_vec=None):
     con = _connect()
     try:
+        if query and query_vec is not None:
+            # hybrid path: semantic + keyword over a bounded recency pool
+            from .recall import rank_hybrid
+            rows = con.execute(
+                """SELECT fact, confidence, updated_at, embedding FROM user_facts
+                   WHERE user_id=? ORDER BY confidence DESC, updated_at DESC
+                   LIMIT 100""",
+                (str(user_id),),
+            ).fetchall()
+            return rank_hybrid(
+                [dict(r) for r in rows], query, query_vec,
+                text_key="fact", time_key="updated_at",
+                vec_key="embedding")[:int(limit)]
         if query:
             # relevance path: rank a bounded recency pool by keyword
             # overlap so topical (even old) facts win; pure recency
@@ -390,7 +437,7 @@ def get_facts(user_id, limit=5, query=None):
             rows = con.execute(
                 """SELECT fact, confidence, updated_at FROM user_facts
                    WHERE user_id=? ORDER BY confidence DESC, updated_at DESC
-                   LIMIT 20""",
+                   LIMIT 100""",
                 (str(user_id),),
             ).fetchall()
             ranked = rank_by_overlap(
@@ -398,7 +445,7 @@ def get_facts(user_id, limit=5, query=None):
                 text_key="fact", time_key="updated_at")
             return ranked[:int(limit)]
         rows = con.execute(
-            """SELECT fact, confidence, updated_at FROM user_facts
+            """SELECT fact, confidence, updated_at, embedding FROM user_facts
                WHERE user_id=? ORDER BY confidence DESC, updated_at DESC LIMIT ?""",
             (str(user_id), int(limit)),
         ).fetchall()
@@ -486,6 +533,61 @@ def set_last_summary_upto(channel_id, msg_id):
                ON CONFLICT(channel_id) DO UPDATE SET
                  last_summary_upto=excluded.last_summary_upto""",
             (str(channel_id), int(msg_id)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+# ---------------- embedding backfill ----------------
+
+def get_unembedded_summaries(limit=5):
+    """Oldest summaries lacking vectors (pre-migration or Ollama was down)."""
+    con = _connect()
+    try:
+        rows = con.execute(
+            """SELECT chunk_id, summary FROM summaries
+               WHERE embedding IS NULL ORDER BY chunk_id ASC LIMIT ?""",
+            (int(limit),),
+        ).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+def get_unembedded_facts(limit=5):
+    con = _connect()
+    try:
+        rows = con.execute(
+            """SELECT user_id, fact FROM user_facts
+               WHERE embedding IS NULL ORDER BY updated_at ASC LIMIT ?""",
+            (int(limit),),
+        ).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+def set_summary_embedding(chunk_id, embedding):
+    con = _connect()
+    try:
+        con.execute(
+            "UPDATE summaries SET embedding=? WHERE chunk_id=?",
+            (bytes(embedding) if embedding is not None else None,
+             int(chunk_id)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def set_fact_embedding(user_id, fact, embedding):
+    con = _connect()
+    try:
+        con.execute(
+            "UPDATE user_facts SET embedding=? WHERE user_id=? AND fact=?",
+            (bytes(embedding) if embedding is not None else None,
+             str(user_id), str(fact)),
         )
         con.commit()
     finally:

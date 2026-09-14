@@ -158,12 +158,15 @@ prompt:
 * **Channel summaries** — every 30 messages per channel are summarized by the
   background chain into `summaries` (or earlier if the backlog passes a token
   budget, so long messages don't bloat the raw window); the 2 most relevant
-  are injected. Channels with no bot mention in the recent buffer are skipped
+  are injected, ranked by embedding similarity + keyword boost like facts.
+  Channels with no bot mention in the recent buffer are skipped
   until mentioned again (DMs always qualify).
 * **Per-user facts** — durable traits extracted for all speakers batched
-  on each summary chunk. At prompt time facts are ranked by keyword overlap
-  with the current message (recency tiebreak), so a topical old fact beats
-  newer trivial ones; top 5 per user are injected.
+  on each summary chunk, embedded at write time. At prompt time facts rank
+  by embedding similarity + keyword boost (recency tiebreak), so a topical
+  old fact beats newer trivial ones; top 5 per user are injected. Disable
+  with `memory_semantic_rank: false` for pure keyword ranking (also the
+  automatic fallback when Ollama is down).
 * **Peer recall** — when someone mentions, names, or chats alongside other
   users, their facts are injected too (`Known about <name>:`), so the bot
   can answer *about* people, not just *to* the author. Name matching is

@@ -66,6 +66,68 @@ def rank_by_overlap(items, query, text_key="fact", time_key="updated_at"):
     return [s[2] for s in scored]
 
 
+def cosine_sim(a, b):
+    """Cosine similarity of two float sequences. 0.0 on bad input."""
+    if a is None or b is None:
+        return 0.0
+    try:
+        import numpy as np
+        va = np.asarray(a, dtype="float64").ravel()
+        vb = np.asarray(b, dtype="float64").ravel()
+        if va.shape != vb.shape or va.size == 0:
+            return 0.0
+        denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
+        if not denom:
+            return 0.0
+        result = float(np.dot(va, vb) / denom)
+        return result if result == result else 0.0  # NaN guard
+    except Exception:
+        return 0.0
+
+
+def decode_embedding(blob, dim=768):
+    """Decode a float32 BLOB from the DB. None when missing/invalid."""
+    if not blob:
+        return None
+    try:
+        import numpy as np
+        vec = np.frombuffer(bytes(blob), dtype="float32")
+        if vec.size != dim:
+            return None
+        return vec
+    except Exception:
+        return None
+
+
+def rank_hybrid(items, query, query_vec=None, text_key="fact",
+                time_key="updated_at", vec_key="embedding",
+                sem_weight=2.0, kw_weight=0.5):
+    """Rank by semantic similarity + keyword overlap + recency.
+
+    Items without a decodable embedding (or when query_vec is None)
+    score on keywords only — identical to rank_by_overlap for those rows,
+    so mixed migrated/unmigrated pools degrade gracefully. Pure function.
+    """
+    query_tokens = set(tokenize(query, max_tokens=20))
+    scored = []
+    for item in items:
+        text = str(item.get(text_key) or "").lower()
+        overlap = (sum(1 for t in query_tokens if t in text)
+                   if query_tokens else 0)
+        sem = 0.0
+        if query_vec is not None:
+            sem = cosine_sim(
+                query_vec, decode_embedding(item.get(vec_key)))
+        try:
+            ts = float(item.get(time_key) or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        scored.append((sem * sem_weight + overlap * kw_weight, ts, item))
+    scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+    # all-zero scores collapse to pure recency (legacy order)
+    return [s[2] for s in scored]
+
+
 def search_messages(channel_id, query, limit=5):
     """Return up to `limit` past messages relevant to query.
 

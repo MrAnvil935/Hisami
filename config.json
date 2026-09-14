@@ -55,6 +55,9 @@
   "memory_recall_enabled": true,
   // Past messages injected per reply (keyword-ranked).
   "memory_recall_limit": 3,
+  // Rank facts/summaries by embedding similarity + keyword boost (needs
+  // Ollama up; keyword-only fallback otherwise). Set false for pure keyword.
+  "memory_semantic_rank": true,
   // Other users (mentioned/named/recent) whose facts also inject, ...
   "memory_peer_max_users": 2,
   // ...with at most this many facts each.
