@@ -672,7 +672,8 @@ async def get_web_context(channel_id, user_message):
 # ============================================================
 
 
-async def get_memory_context(channel_id, user_message, author_id=""):
+async def get_memory_context(channel_id, user_message, author_id="",
+                             username=""):
     """Fetch long-term memory: summaries + recalled messages + user facts.
 
     Runs SQLite lookups in threads; returns a formatted prompt section.
@@ -717,7 +718,8 @@ async def get_memory_context(channel_id, user_message, author_id=""):
         blocks.append(f"\nRelevant past messages:\n{r_lines}\n")
     if facts:
         f_lines = "\n".join(f"- {f['fact']}" for f in facts)
-        blocks.append(f"\nKnown about this user:\n{f_lines}\n")
+        who = username.strip() if username and username.strip() else "this user"
+        blocks.append(f"\nKnown about {who}:\n{f_lines}\n")
 
     # Peer facts: other users referenced by mention, by name, or simply
     # speaking recently — so the model can answer ABOUT them, not just
@@ -750,7 +752,7 @@ async def build_prompt(channel_id, user_message, username, author_id="",
     examples, web_block, memory_block = await asyncio.gather(
         asyncio.to_thread(retrieve_examples, channel_id, user_message),
         get_web_context(channel_id, user_message),
-        get_memory_context(channel_id, user_message, author_id),
+        get_memory_context(channel_id, user_message, author_id, username),
     )
 
     prompt = f"\n{MASTER_PROMPT}\n\n"
