@@ -82,6 +82,18 @@ class StoreTest(TempDBMixin, unittest.TestCase):
         self.assertEqual(mem_store.get_messages_by_ids("other", [1]), {})
         self.assertEqual(mem_store.get_messages_by_ids("cb", []), {})
 
+    def test_get_messages_before(self):
+        for i in range(1, 6):
+            mem_store.add_message("cc", i, "u1", "alice", "user", f"m{i}")
+        rows = mem_store.get_messages_before("cc", 4, limit=3)
+        self.assertEqual([r["msg_id"] for r in rows], [1, 2, 3])
+        self.assertEqual(
+            [r["msg_id"] for r in mem_store.get_messages_before("cc", 2, 10)],
+            [1])
+        self.assertEqual(mem_store.get_messages_before("cc", 1, 3), [])
+        self.assertEqual(mem_store.get_messages_before("cc", "bad", 3), [])
+        self.assertEqual(mem_store.get_messages_before("other", 4, 3), [])
+
     def test_clear_recent_keeps_summaries_and_facts(self):
         self._seed(n=10)
         mem_store.add_summary("c1", "talked about minecraft", 1, 5)
@@ -328,6 +340,35 @@ class RecallTest(TempDBMixin, unittest.TestCase):
         # unknown bot fails open (never halts summarization)
         self.assertTrue(mem_recall.channel_engaged([], ""))
         self.assertTrue(mem_recall.channel_engaged([], None))
+
+    def test_format_reply_context(self):
+        parent = {"author_name": "alice", "content": "is this real?"}
+        prev = [
+            {"author_name": "bob", "content": "look at this"},
+            {"author_name": "carol", "content": "  "},
+        ]
+        out = mem_recall.format_reply_context(parent, prev)
+        self.assertIn("Replied-to message:", out)
+        self.assertIn("alice: is this real?", out)
+        self.assertIn("Previous context:", out)
+        self.assertIn("bob: look at this", out)
+        self.assertNotIn("carol", out)  # blank rows skipped
+        # no previous context -> parent only
+        out = mem_recall.format_reply_context(parent, [])
+        self.assertIn("Replied-to message:", out)
+        self.assertNotIn("Previous context:", out)
+        # truncation honored
+        out = mem_recall.format_reply_context(
+            {"author_name": "a", "content": "y" * 900}, [], 500, 300)
+        self.assertIn("y" * 500, out)
+        self.assertNotIn("y" * 501, out)
+        # missing/empty parent -> '' (caller keeps keyword recall)
+        self.assertEqual(mem_recall.format_reply_context(None, prev), "")
+        self.assertEqual(
+            mem_recall.format_reply_context({"author_name": "a"}, prev), "")
+        self.assertEqual(
+            mem_recall.format_reply_context(
+                {"author_name": "a", "content": "   "}, prev), "")
 
     def test_referenced_users_mention(self):
         msgs = [
@@ -725,6 +766,25 @@ class ConfigTest(unittest.TestCase):
         for key in ("discord_token", "model", "ollama_model",
                     "memory_db_path", "summary_model", "vision_model"):
             self.assertIn(key, cfg)
+
+    def test_ollama_base(self):
+        base = mem_config.ollama_base
+        # full chat endpoint -> base (the bot.py config form)
+        self.assertEqual(base("http://localhost:11434/api/chat"),
+                         "http://localhost:11434")
+        # bare base passes through (the old embed.py form)
+        self.assertEqual(base("http://localhost:11434"),
+                         "http://localhost:11434")
+        # custom host/port with extra path segments
+        self.assertEqual(base("https://gpu-box.lan:11434/api/chat"),
+                         "https://gpu-box.lan:11434")
+        self.assertEqual(base("http://10.0.0.5:8080/v1"),
+                         "http://10.0.0.5:8080")
+        # garbage -> default, never empty (callers format paths onto it)
+        self.assertEqual(base(""), "http://localhost:11434")
+        self.assertEqual(base(None), "http://localhost:11434")
+        self.assertEqual(base("not a url"), "http://localhost:11434")
+        self.assertEqual(base("ftp://x/y"), "http://localhost:11434")
 
 
 if __name__ == "__main__":

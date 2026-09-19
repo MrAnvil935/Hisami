@@ -258,3 +258,30 @@ def channel_engaged(messages, bot_id, lookback=30):
         if pattern.search(str(m.get("content") or "")):
             return True
     return False
+
+
+def format_reply_context(parent, previous, parent_chars=500, ctx_chars=300):
+    """Render a replied-to message + preceding context for the prompt.
+
+    parent: dict with author_name/content (DB row or fetched message data).
+    previous: list of similar dicts, oldest->newest. Returns '' when the
+    parent is missing/empty (caller keeps keyword recall instead).
+    Pure function (no I/O) so it is unit-testable.
+    """
+    if not parent or not str(parent.get("content") or "").strip():
+        return ""
+    lines = [
+        "Replied-to message:",
+        f"{parent.get('author_name', '?')}: "
+        f"{str(parent.get('content') or '')[:parent_chars]}",
+    ]
+    ctx = [m for m in (previous or [])
+           if str(m.get("content") or "").strip()]
+    if ctx:
+        lines.append("Previous context:")
+        lines.extend(
+            f"{m.get('author_name', '?')}: "
+            f"{str(m.get('content') or '')[:ctx_chars]}"
+            for m in ctx
+        )
+    return "\n" + "\n".join(lines) + "\n"

@@ -90,6 +90,10 @@ MEMORY_RECALL_LIMIT = config.get("memory_recall_limit", 3)
 MEMORY_SEMANTIC_RANK = config.get("memory_semantic_rank", True)
 MEMORY_PEER_MAX_USERS = config.get("memory_peer_max_users", 2)
 MEMORY_PEER_MAX_FACTS = config.get("memory_peer_max_facts", 3)
+# Replied-to context replacing keyword recall for out-of-window parents:
+# how many preceding messages to include, and parent truncation budget.
+REPLY_CONTEXT_BEFORE = config.get("reply_context_before", 3)
+REPLY_CONTEXT_PARENT_CHARS = config.get("reply_context_max_chars", 500)
 COOLDOWN_SECONDS = config.get("cooldown_seconds", 5)
 MEMORY_PRUNE_KEEP = config.get("memory_prune_keep", 60)
 
@@ -113,6 +117,7 @@ VISION_OLLAMA_MODEL = config.get("vision_ollama_model", "qwen2.5vl:3b")
 VISION_MODEL = config.get("vision_model", "openrouter/free")
 VISION_TEMPERATURE = config.get("vision_temperature", 0.2)
 VISION_MAX_TOKENS = config.get("vision_max_tokens", 1200)
+VISION_OLLAMA_CTX = config.get("vision_ollama_ctx", 8192)
 VISION_TIMEOUT = config.get("vision_timeout", 90)
 VISION_MAX_BYTES = config.get("vision_max_bytes", 10 * 1024 * 1024)
 VISION_CACHE_TTL = config.get("vision_cache_ttl_days", 7) * 86400
@@ -192,7 +197,9 @@ DIM = 768  # nomic-embed-text embedding size
 EMBED_MODEL = "nomic-embed-text"
 ASSISTANT_NAME = "Assistant"  # I would leave it as it is or it can cause issues with output quality
 
-OLLAMA_BASE = "http://localhost:11434"
+# Derived from the configured ollama_url above — /api/ps and /api/embed
+# follow whatever host:port is configured, no second hardcoded URL.
+OLLAMA_BASE = mem_config.ollama_base(OLLAMA_URL)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_HEADERS = {
@@ -673,11 +680,12 @@ async def get_web_context(channel_id, user_message):
 
 
 async def get_memory_context(channel_id, user_message, author_id="",
-                             username=""):
+                             username="", reply_block=""):
     """Fetch long-term memory: summaries + recalled messages + user facts.
 
     Runs SQLite lookups in threads; returns a formatted prompt section.
-    Fail-soft: any error -> ''.
+    When reply_block is set (ping replying to an out-of-window message),
+    it REPLACES the keyword recall block. Fail-soft: any error -> ''.
     """
     query_vec = None
     if MEMORY_SEMANTIC_RANK:
@@ -710,7 +718,9 @@ async def get_memory_context(channel_id, user_message, author_id="",
     if summaries:
         s_lines = "\n".join(f"- {s['summary'][:600]}" for s in summaries)
         blocks.append(f"\nOlder conversation summary:\n{s_lines}\n")
-    if recalled:
+    if reply_block:
+        blocks.append(reply_block)
+    elif recalled:
         r_lines = "\n".join(
             f"- {r.get('author_name', '?')}: {(r.get('content') or '')[:300]}"
             for r in recalled
@@ -747,12 +757,13 @@ async def get_memory_context(channel_id, user_message, author_id="",
 
 
 async def build_prompt(channel_id, user_message, username, author_id="",
-                       image_block=""):
+                       image_block="", reply_block=""):
     # Retrieval, web search and long-term memory are independent.
     examples, web_block, memory_block = await asyncio.gather(
         asyncio.to_thread(retrieve_examples, channel_id, user_message),
         get_web_context(channel_id, user_message),
-        get_memory_context(channel_id, user_message, author_id, username),
+        get_memory_context(channel_id, user_message, author_id, username,
+                           reply_block),
     )
 
     prompt = f"\n{MASTER_PROMPT}\n\n"
@@ -968,16 +979,20 @@ async def startup_model_check():
 
 
 async def ollama_chat(messages, model=None, temperature=0.9,
-                      num_ctx=None, timeout=None, purpose="chat"):
+                      num_ctx=None, timeout=None, purpose="chat",
+                      num_predict=None):
     resolved_model = model or OLLAMA_MODEL
+    options = {
+        "temperature": temperature,
+        "top_p": 0.95,
+        "num_ctx": num_ctx if num_ctx is not None else MAX_OLLAMA_TOKENS,
+    }
+    if num_predict is not None:
+        options["num_predict"] = num_predict
     payload = {
         "model": resolved_model,
         "messages": messages,
-        "options": {
-            "temperature": temperature,
-            "top_p": 0.95,
-            "num_ctx": num_ctx if num_ctx is not None else MAX_OLLAMA_TOKENS,
-        },
+        "options": options,
         "think": False,
         "stream": False,
         "keep_alive": "30m",
@@ -1184,6 +1199,7 @@ async def summary_generate(messages, purpose="summary"):
             num_ctx=SUMMARY_OLLAMA_CTX,
             timeout=SUMMARY_OLLAMA_TIMEOUT,
             purpose=purpose,
+            num_predict=SUMMARY_MAX_TOKENS,
         )
         if reply:
             return reply
@@ -1262,7 +1278,11 @@ async def vision_generate(image_b64, question):
                 "content": question,
                 "images": [image_b64],
             }],
-            "options": {"temperature": VISION_TEMPERATURE},
+            "options": {
+                "temperature": VISION_TEMPERATURE,
+                "num_ctx": VISION_OLLAMA_CTX,
+                "num_predict": VISION_MAX_TOKENS,
+            },
             "stream": False,
             "keep_alive": "30m",
         }
@@ -1331,11 +1351,29 @@ async def vision_generate(image_b64, question):
     return ""
 
 
-async def resolve_prompt_image(message):
+async def resolve_reply_target(message):
+    """Return the discord Message being replied to, or None.
+
+    Uses the cached resolved reference first, Discord fetch fallback.
+    Shared by the image and text reply-context paths so one ping costs
+    at most one fetch. Fail-soft.
+    """
+    ref = getattr(message, "reference", None)
+    target = getattr(ref, "resolved", None) if ref else None
+    if target is None and ref and getattr(ref, "message_id", None):
+        try:
+            target = await message.channel.fetch_message(ref.message_id)
+        except Exception:
+            target = None
+    return target
+
+
+async def resolve_prompt_image(message, target=None):
     """Find the FIRST image for a ping, or (None, None).
 
     Order: own uploads → links in own text → replied-to message's
     uploads/links. Videos are never returned here (annotation only).
+    Pass a pre-resolved target to avoid a second fetch.
     """
     atts = mem_vision.classify_attachments(getattr(message, "attachments", []))
     for a in atts:
@@ -1345,13 +1383,8 @@ async def resolve_prompt_image(message):
     for url in mem_vision.extract_image_urls(getattr(message, "content", "")):
         return mem_vision.cache_key(url), url
 
-    ref = getattr(message, "reference", None)
-    target = getattr(ref, "resolved", None) if ref else None
-    if target is None and ref and getattr(ref, "message_id", None):
-        try:
-            target = await message.channel.fetch_message(ref.message_id)
-        except Exception:
-            target = None
+    if target is None:
+        target = await resolve_reply_target(message)
 
     if target is not None:
         atts = mem_vision.classify_attachments(
@@ -1364,6 +1397,101 @@ async def resolve_prompt_image(message):
             return mem_vision.cache_key(url), url
 
     return None, None
+
+
+def _normalize_fetched(author, content, message_id, attachments=()):
+    """Discord objects -> DB-shaped row dict for storage + rendering."""
+    is_bot = bool(getattr(author, "bot", False))
+    return {
+        "msg_id": message_id,
+        "author_id": str(getattr(author, "id", "")),
+        "author_name": str(author),
+        "author": str(author),
+        "role": "assistant" if is_bot else "user",
+        "content": str(content or ""),
+        "reply_to": None,
+        "attachments": list(attachments or []),
+    }
+
+
+async def build_reply_context_block(channel_id, message, target, window_ids):
+    """Replied-to message + preceding context for out-of-window parents.
+
+    Returns '' when the ping is not a reply, the parent is already in
+    the prompt window, or the parent is unresolvable anywhere (caller
+    keeps keyword recall in those cases). Fetched Discord messages are
+    stored via the normal path so memory keeps continuity.
+    """
+    ref = getattr(message, "reference", None)
+    parent_id = getattr(ref, "message_id", None) if ref else None
+    if not parent_id:
+        return ""
+    try:
+        parent_id = int(parent_id)
+    except (TypeError, ValueError):
+        return ""
+    if parent_id in (window_ids or set()):
+        return ""
+
+    parent = None
+    previous = []
+    try:
+        rows = await asyncio.to_thread(
+            mem_store.get_messages_by_ids, channel_id, [parent_id])
+        parent = rows.get(parent_id)
+        if parent is not None:
+            parent = {
+                "author_name": parent.get("author_name", "?"),
+                "content": parent.get("content", ""),
+            }
+            previous = await asyncio.to_thread(
+                mem_store.get_messages_before, channel_id, parent_id,
+                REPLY_CONTEXT_BEFORE)
+    except Exception:
+        log.exception("reply context DB lookup failed")
+        return ""
+
+    if parent is None and target is not None:
+        try:
+            t_author = getattr(target, "author", None)
+            t_content = getattr(target, "content", "")
+            if t_author is not None and str(t_content or "").strip():
+                parent = {"author_name": str(t_author), "content": t_content}
+                hist = [m async for m in message.channel.history(
+                    before=target, limit=REPLY_CONTEXT_BEFORE)]
+                previous = []
+                for hm in reversed(hist):
+                    row = _normalize_fetched(
+                        getattr(hm, "author", None),
+                        getattr(hm, "content", ""),
+                        getattr(hm, "id", 0),
+                        mem_vision.classify_attachments(
+                            getattr(hm, "attachments", [])))
+                    previous.append(row)
+                    # store for memory continuity (idempotent upsert)
+                    await asyncio.to_thread(
+                        add_message, channel_id, row["msg_id"],
+                        row["author_name"],
+                        "assistant" if row["role"] == "assistant" else "user",
+                        row["content"], None, row["author_id"],
+                        mem_vision.classify_attachments(
+                            getattr(hm, "attachments", [])))
+                await asyncio.to_thread(
+                    add_message, channel_id,
+                    getattr(target, "id", parent_id), str(t_author),
+                    "assistant" if bool(getattr(t_author, "bot", False))
+                    else "user",
+                    t_content, None, str(getattr(t_author, "id", "")),
+                    mem_vision.classify_attachments(
+                        getattr(target, "attachments", [])))
+        except Exception:
+            log.exception("reply context Discord fetch failed")
+            return ""
+
+    if parent is None:
+        return ""
+    return mem_recall.format_reply_context(
+        parent, previous, REPLY_CONTEXT_PARENT_CHARS, 300)
 
 
 async def describe_image(source_key, image_url, question=VISION_QUESTION):
@@ -1931,7 +2059,6 @@ async def backfill_embeddings(limit=5):
 async def memory_maintenance_loop():
     """Periodically summarize channels seen recently. Fail-soft."""
     await client.wait_until_ready()
-    seen = set()
     while not client.is_closed():
         try:
             bot_id = str(client.user.id) if client.user else ""
@@ -1956,8 +2083,9 @@ async def memory_maintenance_loop():
                     if chunk:
                         await summarize_channel(ch.id)
                         await asyncio.sleep(2)  # don't hammer the LLM
-            # also cover DM channels the bot has seen via cooldown map
-            for channel_id in list(seen):
+            # also cover DM channels the bot has seen (_track_channel.seen
+            # is populated by on_message; a local set here would stay empty)
+            for channel_id in list(getattr(_track_channel, "seen", ())):
                 if not await is_channel_engaged(channel_id, bot_id):
                     continue
                 await summarize_channel(channel_id)
@@ -1974,7 +2102,7 @@ async def is_channel_engaged(channel_id, bot_id):
     """
     try:
         ch = client.get_channel(int(channel_id))
-        if isinstance(ch, discord.DMChannel):
+        if isinstance(ch, (discord.DMChannel, discord.GroupChannel)):
             return True
         recent = await asyncio.to_thread(
             mem_store.get_recent, channel_id, MEMORY_ENGAGE_LOOKBACK)
@@ -2323,7 +2451,9 @@ async def on_message(message):
         msg_attachments,
     )
 
-    if client.user not in message.mentions:
+    if (client.user not in message.mentions
+            and not isinstance(message.channel,
+                               (discord.DMChannel, discord.GroupChannel))):
         return
 
     # ---- 5s per-user cooldown (reliability) ----
@@ -2364,9 +2494,16 @@ async def on_message(message):
     async with lock:
         try:
             async with message.channel.typing():
+                # Resolve the replied-to message once, shared by the image
+                # and text reply-context paths (at most one Discord fetch).
+                reply_target = None
+                if message.reference and message.reference.message_id:
+                    reply_target = await resolve_reply_target(message)
+
                 # First (and only) image: own upload, link, or replied-to.
                 image_block = ""
-                source_key, image_url = await resolve_prompt_image(message)
+                source_key, image_url = await resolve_prompt_image(
+                    message, reply_target)
                 if source_key and image_url:
                     desc, cached = await describe_image(
                         source_key, image_url)
@@ -2379,12 +2516,31 @@ async def on_message(message):
                             f"conversation.)\n"
                         )
 
+                # Replied-to context replacing keyword recall, but only when
+                # the parent is outside the prompt window (else it is already
+                # visible in Conversation: and recall stays as-is).
+                reply_block = ""
+                if reply_target is not None or (
+                        message.reference and message.reference.message_id):
+                    try:
+                        window = await asyncio.to_thread(
+                            _history_compat, message.channel.id)
+                        reply_block = await build_reply_context_block(
+                            message.channel.id, message, reply_target,
+                            {m["id"] for m in window})
+                    except Exception:
+                        log.exception("reply context failed")
+                        reply_block = ""
+                    if reply_block:
+                        log.info("[reply] out-of-window parent context injected")
+
                 prompt = await build_prompt(
                     message.channel.id,
                     cleaned,
                     str(message.author),
                     str(message.author.id),
                     image_block,
+                    reply_block,
                 )
 
                 log.debug("PROMPT SENT TO MODEL (%d chars):\n%s\n[END PROMPT]",

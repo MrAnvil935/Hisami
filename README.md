@@ -15,6 +15,8 @@ The bot builds an embedding index from exported Discord messages and uses it as 
   involved (result count 1–10, default 5)
 * Slash commands for status information and maintenance
 * Two-sink debug logging: concise terminal + full payloads on disk
+* Replies on @-mention in servers; in DMs every message gets a reply
+  (5s per-user cooldown still applies everywhere)
 
 ---
 
@@ -104,6 +106,10 @@ Tunable groups (all have built-in defaults, see `config.json`):
 * `vision_ollama_model` / `vision_model` — image description chain
   (local first, OpenRouter last resort); see `vision_*` limits.
   Both models must be vision-capable (text-only models return nothing useful).
+  `vision_ollama_ctx` should stay generous (default 8192): images consume
+  hundreds of context tokens each and a small ctx truncates them silently.
+  `summary_max_tokens` / `vision_max_tokens` are enforced on both backends
+  (Ollama `num_predict` included), so raise them on length failures.
 * `max_examples` / `examples_max_tokens` — style-example retrieval limits
 * `memory_*` — buffer size, summary chunk size, recall limits, cooldowns
 * `search_*` — web search triggers and limits
@@ -160,7 +166,8 @@ prompt:
   budget, so long messages don't bloat the raw window); the 2 most relevant
   are injected, ranked by embedding similarity + keyword boost like facts.
   Channels with no bot mention in the recent buffer are skipped
-  until mentioned again (DMs always qualify).
+  until mentioned again (DMs always qualify and are summarized like
+  any channel).
 * **Per-user facts** — durable traits extracted for all speakers batched
   on each summary chunk, embedded at write time. At prompt time facts rank
   by embedding similarity + keyword boost (recency tiebreak), so a topical
@@ -177,6 +184,9 @@ prompt:
   Videos are never processed, but history lines are annotated
   (`[image: foo.png]`, `[video: bar.mp4]`) so the model knows media exists.
 * **Keyword recall** — FTS5 search over past messages, top 3 injected.
+  When a ping replies to a message outside the recent window, this block is
+  replaced by that message plus preceding context (DB first, Discord fetch
+  fallback; fetched messages are stored so memory keeps continuity).
 
 `/clearmemory` clears only the recent short-term buffer (to unstick a looping
 model); summaries and facts are preserved. `/status` reports buffer,

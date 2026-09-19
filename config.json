@@ -62,6 +62,10 @@
   "memory_peer_max_users": 2,
   // ...with at most this many facts each.
   "memory_peer_max_facts": 3,
+  // Reply-pings: preceding messages pulled with an out-of-window parent,
+  // and max chars of the parent itself in the replacement block.
+  "reply_context_before": 3,
+  "reply_context_max_chars": 500,
   // Per-user cooldown between bot replies (seconds). Replies inside the
   // window get a "slow down" nudge instead of a generation.
   "cooldown_seconds": 5,
@@ -99,6 +103,9 @@
   // Max tokens per description. Reasoning models spend output tokens on
   // thinking, so raise on length-related failures.
   "vision_max_tokens": 1200,
+  // Context window for the local vision model. Images eat hundreds of
+  // tokens each — a small ctx silently truncates them. Higher costs VRAM.
+  "vision_ollama_ctx": 8192,
   // Seconds per vision request (download + describe).
   "vision_timeout": 90,
   // Largest downloadable image in bytes (10 MB). Bigger skipped silently.

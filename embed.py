@@ -4,11 +4,16 @@ import numpy as np
 import hnswlib
 from tqdm import tqdm
 
+from memory.config import load_config as _load_config, ollama_base
+
 # ============================================================
 # CONFIG
 # ============================================================
 
-OLLAMA_URL = "http://localhost:11434"
+try:
+    OLLAMA_URL = ollama_base(_load_config().get("ollama_url"))
+except Exception:
+    OLLAMA_URL = ollama_base(None)
 EMBED_MODEL = "nomic-embed-text"
 
 INPUT_FILE = "dataset.jsonl"

@@ -53,3 +53,24 @@ def load_config(path="config.json"):
     """Load config.json (or .jsonc-style content) into a dict."""
     with open(path, "r", encoding="utf-8") as f:
         return json.loads(strip_json_comments(f.read()))
+
+
+DEFAULT_OLLAMA_BASE = "http://localhost:11434"
+
+
+def ollama_base(url, default=DEFAULT_OLLAMA_BASE):
+    """Derive the Ollama server base (scheme://host:port) from any URL form.
+
+    Accepts the full chat endpoint ("http://host:port/api/chat") or a bare
+    base ("http://host:port") — both yield the base, so /api/ps, /api/embed
+    and /api/chat follow the one configured value. Garbage in -> default.
+    Pure function (no I/O) so it is unit-testable.
+    """
+    try:
+        from urllib.parse import urlparse
+        parts = urlparse(str(url or "").strip())
+        if parts.scheme in ("http", "https") and parts.netloc:
+            return f"{parts.scheme}://{parts.netloc}"
+    except Exception:
+        pass
+    return default

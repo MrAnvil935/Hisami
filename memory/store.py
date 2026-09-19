@@ -221,6 +221,38 @@ def get_messages_by_ids(channel_id, ids):
     return out
 
 
+def get_messages_before(channel_id, msg_id, limit=3):
+    """Messages strictly before msg_id, oldest->newest, up to limit.
+
+    Supplies the 'little bit of previous context' for replied-to message
+    blocks. Attachments parsed like get_recent. Empty on bad input.
+    """
+    try:
+        anchor = int(msg_id)
+    except (TypeError, ValueError):
+        return []
+    con = _connect()
+    try:
+        rows = con.execute(
+            """SELECT msg_id, author_id, author_name, role,
+                      content, reply_to, created_at, attachments
+               FROM messages WHERE channel_id=? AND msg_id < ?
+               ORDER BY msg_id DESC LIMIT ?""",
+            (str(channel_id), anchor, int(limit)),
+        ).fetchall()
+    finally:
+        con.close()
+    out = []
+    for r in reversed(rows):
+        d = dict(r)
+        try:
+            d["attachments"] = json.loads(d.get("attachments") or "[]")
+        except Exception:
+            d["attachments"] = []
+        out.append(d)
+    return out
+
+
 def get_max_msg_id(channel_id):
     con = _connect()
     try:
