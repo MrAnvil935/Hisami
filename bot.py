@@ -75,6 +75,19 @@ OLLAMA_TIMEOUT = config["ollama_timeout"]
 OLLAMA_AUTOLOAD = config.get("ollama_autoload", False)
 
 BOTNAME = config["botname"]
+BOT_STATUS = config.get("bot_status", "online")
+
+# Map for the bot_status config value. Parsed in on_ready; unknown
+# values fall back to online with a warning.
+BOT_STATUS_MAP = {
+    "online": discord.Status.online,
+    "idle": discord.Status.idle,
+    "away": discord.Status.idle,
+    "dnd": discord.Status.dnd,
+    "do_not_disturb": discord.Status.dnd,
+    "invisible": discord.Status.invisible,
+    "offline": discord.Status.invisible,
+}
 
 # ---- persistent memory settings ----
 MEMORY_DB_PATH = config.get("memory_db_path", "memory.db")
@@ -104,6 +117,8 @@ SUMMARY_OLLAMA_MODEL = config.get("summary_ollama_model", "gemma3n:e4b")
 SUMMARY_MODEL = config.get("summary_model", "openrouter/free")
 SUMMARY_TEMPERATURE = config.get("summary_temperature", 0.2)
 SUMMARY_MAX_TOKENS = config.get("summary_max_tokens", 800)
+SUMMARY_INPUT_CHARS = config.get("summary_input_chars", 500)
+FACT_INPUT_CHARS = config.get("fact_input_chars", 300)
 SUMMARY_OLLAMA_TIMEOUT = config.get("summary_ollama_timeout", 60)
 SUMMARY_TIMEOUT = config.get("summary_timeout", 60)
 SUMMARY_MAX_RETRIES = config.get("summary_max_retries", 1)
@@ -1930,7 +1945,8 @@ async def summarize_channel(channel_id):
     if not chunk:
         return False
     try:
-        prompt = mem_summary.build_summary_prompt(chunk)
+        prompt = mem_summary.build_summary_prompt(
+            chunk, max_chars=SUMMARY_INPUT_CHARS)
         summary_text = await summary_generate([
             {"role": "system", "content": mem_summary.SUMMARIZER_SYSTEM},
             {"role": "user", "content": prompt},
@@ -1981,7 +1997,8 @@ async def extract_chunk_facts(channel_id, chunk):
     if not speakers:
         return
     try:
-        prompt = mem_summary.build_multi_fact_prompt(chunk)
+        prompt = mem_summary.build_multi_fact_prompt(
+            chunk, max_chars=FACT_INPUT_CHARS)
         raw = await summary_generate([
             {"role": "system", "content":
              "You extract stable user facts as JSON. Return ONLY a JSON object."},
@@ -2406,6 +2423,14 @@ async def web_command(
 @client.event
 async def on_ready():
     await tree.sync()
+
+    status = BOT_STATUS_MAP.get(str(BOT_STATUS).lower(), discord.Status.online)
+    if str(BOT_STATUS).lower() not in BOT_STATUS_MAP:
+        log.warning("[bot] unknown bot_status %r, using online", BOT_STATUS)
+    try:
+        await client.change_presence(status=status)
+    except Exception:
+        log.exception("[bot] change_presence failed")
 
     if not hasattr(client, "prompt_cleanup_task"):
         client.prompt_cleanup_task = asyncio.create_task(

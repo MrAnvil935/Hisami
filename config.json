@@ -82,6 +82,12 @@
   "summary_temperature": 0.2,
   // Max tokens per summary/fact call. Raise on length-related failures.
   "summary_max_tokens": 800,
+  // Chars kept per message in the summarizer input transcript. Guards
+  // prompt size against copypastas; the summary output is still bounded
+  // by summary_max_tokens above.
+  "summary_input_chars": 500,
+  // Same guard for the fact-extraction transcript.
+  "fact_input_chars": 300,
   // Seconds per local summary request.
   "summary_ollama_timeout": 60,
   // Seconds per OpenRouter summary request.
@@ -146,6 +152,9 @@
 
   // Display name used in /status.
   "botname": "Hisami",
+  // Presence shown on the profile: online, idle (away), dnd,
+  // or invisible. Unknown values fall back to online.
+  "bot_status": "online",
   // /clearmemory command (clears recent buffer).
   "clear_command_name": "clearmemory",
   "clear_command_description":"Removes recent messages from bot's memory",

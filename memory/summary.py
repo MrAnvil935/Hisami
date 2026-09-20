@@ -13,11 +13,11 @@ SUMMARIZER_SYSTEM = (
 )
 
 
-def build_summary_prompt(messages):
+def build_summary_prompt(messages, max_chars=500):
     lines = []
     for m in messages:
         author = m.get("author_name", "?")
-        content = (m.get("content") or "")[:500]
+        content = (m.get("content") or "")[:max_chars]
         lines.append(f"{author}: {content}")
     convo = "\n".join(lines)
     return (
@@ -27,7 +27,7 @@ def build_summary_prompt(messages):
     )
 
 
-def build_multi_fact_prompt(messages):
+def build_multi_fact_prompt(messages, max_chars=300):
     """Prompt extracting per-user facts for ALL human speakers in a chunk.
 
     Bot rows (role == 'assistant') are excluded by the caller convention:
@@ -39,7 +39,7 @@ def build_multi_fact_prompt(messages):
         if m.get("role") == "assistant":
             continue
         author = m.get("author_name", "?")
-        content = (m.get("content") or "")[:300]
+        content = (m.get("content") or "")[:max_chars]
         lines.append(f"{author}: {content}")
     convo = "\n".join(lines)
     return (

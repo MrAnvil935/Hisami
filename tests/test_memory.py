@@ -506,6 +506,32 @@ class SummaryPromptTest(unittest.TestCase):
         # assistant content must not appear as a speaker line
         self.assertNotIn("Assistant: xd", p)
 
+    def test_summary_prompt_default_truncates_at_500_chars(self):
+        msgs = [{"author_name": "alice", "content": "x" * 600}]
+        p = mem_summary.build_summary_prompt(msgs)
+        self.assertNotIn("x" * 600, p)
+        self.assertIn("x" * 500, p)
+
+    def test_summary_prompt_custom_max_chars(self):
+        msgs = [{"author_name": "alice", "content": "y" * 100}]
+        p = mem_summary.build_summary_prompt(msgs, max_chars=50)
+        self.assertNotIn("y" * 100, p)
+        self.assertIn("y" * 50, p)
+
+    def test_fact_prompt_default_truncates_at_300_chars(self):
+        msgs = [{"author_name": "bob", "role": "user",
+                 "content": "z" * 400}]
+        p = mem_summary.build_multi_fact_prompt(msgs)
+        self.assertNotIn("z" * 400, p)
+        self.assertIn("z" * 300, p)
+
+    def test_fact_prompt_custom_max_chars(self):
+        msgs = [{"author_name": "bob", "role": "user",
+                 "content": "w" * 100}]
+        p = mem_summary.build_multi_fact_prompt(msgs, max_chars=40)
+        self.assertNotIn("w" * 100, p)
+        self.assertIn("w" * 40, p)
+
 
 class ExamplesTest(unittest.TestCase):
     def test_strip_boilerplate(self):
