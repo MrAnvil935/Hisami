@@ -138,7 +138,7 @@ def apply_config(cfg, initial=False):
     OLLAMA_TIMEOUT = cfg["ollama_timeout"]
     OLLAMA_AUTOLOAD = cfg.get("ollama_autoload", False)
 
-    BOTNAME = cfg["botname"]
+    BOTNAME = cfg.get("botname", "Hisami")
     BOT_STATUS = cfg.get("bot_status", "online")
 
     # ---- magnifying-glass debug (react 🔍 to a bot reply, get the full
@@ -2859,11 +2859,11 @@ async def on_raw_reaction_add(payload):
                 pass
             return
         text = mem_debug.format_debug_record(
-            rec, max_chars=DEBUG_MAX_FILE_CHARS)
+            rec, max_chars=DEBUG_MAX_FILE_CHARS, bot_name=BOTNAME)
         try:
             await user.send(file=discord.File(
                 io.BytesIO(text.encode("utf-8")),
-                filename=f"hisami-debug-{payload.message_id}.md"))
+                filename=f"{BOTNAME.lower()}-debug-{payload.message_id}.md"))
         except discord.Forbidden:
             try:
                 await channel.send(

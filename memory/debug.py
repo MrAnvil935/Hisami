@@ -133,14 +133,14 @@ def normalize_record(backend, model, request, response, latency_ms,
     }
 
 
-def format_debug_record(record, max_chars=200000):
+def format_debug_record(record, max_chars=200000, bot_name="Hisami"):
     """Render a normalized record as readable markdown. Never raises."""
     try:
         rec = record if isinstance(record, dict) else {}
         backend = rec.get("backend", "?")
         model = rec.get("model", "?")
         lines = [
-            f"# Hisami debug — {backend} / {model}",
+            f"# {bot_name} debug — {backend} / {model}",
             "",
             f"status: {rec.get('status', '?')} | "
             f"fallback: {rec.get('fallback', False)} | "
@@ -194,4 +194,4 @@ def format_debug_record(record, max_chars=200000):
                      f"{len(convo)} chars total, showing {keep}]")
         return head + convo + reason + tail
     except Exception:
-        return "# Hisami debug\n\n(record failed to render)\n"
+        return f"# {bot_name} debug\n\n(record failed to render)\n"

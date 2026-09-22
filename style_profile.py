@@ -62,13 +62,13 @@ def build_openrouter_payload(samples, model, temperature=0.2):
 
 
 def distill_openrouter(samples, api_key, model, temperature=0.2,
-                       timeout=60, tries=3):
+                       timeout=60, tries=3, bot_name="Hisami"):
     payload = build_openrouter_payload(samples, model, temperature)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "http://localhost",
-        "X-Title": "Hisami style-profile generator",
+        "X-Title": f"{bot_name} style-profile generator",
     }
     last = None
     for attempt in range(1, tries + 1):
@@ -129,6 +129,7 @@ def main():
                 or_model,
                 temperature=config.get("summary_temperature", 0.2),
                 timeout=config.get("summary_timeout", 60),
+                bot_name=config.get("botname", "Hisami"),
             )
             backend = "openrouter"
             print(f"distilled via OpenRouter ({or_model})")

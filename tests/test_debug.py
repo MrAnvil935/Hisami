@@ -144,6 +144,16 @@ class FormatTest(unittest.TestCase):
         text = mem_debug.format_debug_record({"backend": "x"})
         self.assertIn("## Usage", text)
 
+    def test_custom_bot_name(self):
+        rec = mem_debug.normalize_record(
+            "openrouter", "m", OPENROUTER_REQUEST, OPENROUTER_RESPONSE,
+            1, reply_text="hi")
+        text = mem_debug.format_debug_record(rec, bot_name="TestBot")
+        self.assertIn("# TestBot debug", text)
+        self.assertNotIn("Hisami", text)
+        fallback = mem_debug.format_debug_record(None, bot_name="TestBot")
+        self.assertIn("# TestBot debug", fallback)
+
 
 if __name__ == "__main__":
     unittest.main()

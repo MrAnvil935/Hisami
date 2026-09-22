@@ -1,4 +1,4 @@
-"""SQLite-backed persistent memory for Hisami.
+"""SQLite-backed persistent memory for the bot.
 
 All functions are blocking/sync — call them from async code with
 asyncio.to_thread(). Each helper opens its own short-lived connection

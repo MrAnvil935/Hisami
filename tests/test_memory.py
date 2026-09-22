@@ -1,4 +1,4 @@
-"""Unit tests for Hisami persistent memory (stdlib unittest only).
+"""Unit tests for the bot's persistent memory (stdlib unittest only).
 
 Covers the memory/ package plus the pure helpers of style_profile.py.
 bot.py itself is not imported (it calls client.run at module level).
