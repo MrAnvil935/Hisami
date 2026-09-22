@@ -17,6 +17,10 @@ The bot builds an embedding index from exported Discord messages and uses it as 
 * Two-sink debug logging: concise terminal + full payloads on disk
 * Replies on @-mention in servers; in DMs every message gets a reply
   (5s per-user cooldown still applies everywhere)
+* Long replies split into at most `reply_max_parts` (default 3)
+  Discord-sized messages instead of truncating — paragraph breaks
+  preferred, fenced code blocks closed/reopened across chunks so
+  formatting never breaks; only the first chunk is a reply (one ping)
 
 ---
 
@@ -190,7 +194,13 @@ prompt:
 
 `/clearmemory` clears only the recent short-term buffer (to unstick a looping
 model); summaries and facts are preserved. `/status` reports buffer,
-summary, fact and DB sizes plus model load states.
+summary, fact and DB sizes plus model load states. `/reload` re-reads
+`config.json` without restarting (admin only, ephemeral reply): model
+names, temperatures, token budgets, timeouts, prompts, and presence apply
+immediately — including the OpenRouter key and `style_profile.txt`.
+Changed keys are listed; token, DB path, log dir, and slash-command
+names need a restart and are reported as such. A broken config keeps the
+old one with an error message.
 
 ---
 
@@ -229,6 +239,19 @@ venv/bin/python -c "
 from memory.llmlog import read_records
 import json; print(json.dumps(read_records('logs/llm.jsonl')[-1], indent=2))"
 ```
+
+### 🔍 reaction debug
+
+React with 🔍 to any bot reply and the full generation behind it is DM'd
+to you as a markdown file: backend + model (incl. fallback flag),
+latency/attempts, params, the complete prompt messages, reasoning (only
+if the response already contained it), the sent reply text, and usage
+counters. Works for both Ollama and OpenRouter answers. Anyone can use
+it. Messages with no stored record (older than `debug_record_keep`
+replies, or sent before the last restart) get an ❌ reaction instead.
+If your DMs are closed you'll get a short in-channel notice.
+Tune via `debug_reaction_emoji`, `debug_max_file_chars`,
+`debug_record_keep`.
 
 ---
 

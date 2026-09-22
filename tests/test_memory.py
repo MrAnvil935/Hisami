@@ -812,6 +812,21 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(base("not a url"), "http://localhost:11434")
         self.assertEqual(base("ftp://x/y"), "http://localhost:11434")
 
+    def test_diff_configs(self):
+        self.assertEqual(mem_config.diff_configs({"a": 1}, {"a": 1}), [])
+        self.assertEqual(mem_config.diff_configs({"a": 1}, {"a": 2}), ["a"])
+        # added / removed keys count as changed
+        self.assertEqual(mem_config.diff_configs({}, {"a": 1}), ["a"])
+        self.assertEqual(mem_config.diff_configs({"a": 1}, {}), ["a"])
+        # sorted, mixed
+        self.assertEqual(
+            mem_config.diff_configs(
+                {"b": 1, "a": 1, "c": [1]}, {"b": 2, "a": 1, "c": [1]}),
+            ["b"])
+        # non-dict inputs tolerated
+        self.assertEqual(mem_config.diff_configs(None, {"a": 1}), ["a"])
+        self.assertEqual(mem_config.diff_configs(None, None), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,7 @@ import re
 import time
 import traceback
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -21,10 +21,12 @@ from bs4 import BeautifulSoup
 
 from memory import buffer as mem_buffer
 from memory import config as mem_config
+from memory import debug as mem_debug
 from memory import examples as mem_examples
 from memory import facts as mem_facts
 from memory import llmlog as mem_llmlog
 from memory import recall as mem_recall
+from memory import split as mem_split
 from memory import store as mem_store
 from memory import summary as mem_summary
 from memory import vision as mem_vision
@@ -53,29 +55,225 @@ VALID_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 # JSONC: // and /* */ comments allowed (see memory/config.py)
 config = mem_config.load_config("config.json")
 
+# Keys that cannot take effect without a restart: slash-command names are
+# baked into Discord registrations at import, and token / DB path /
+# log dir are bound once at startup. /reload reports these separately.
+RESTART_REQUIRED_KEYS = frozenset({
+    "discord_token",
+    "memory_db_path",
+    "log_dir",
+    "clear_command_name",
+    "clear_command_description",
+    "randomimage_command_name",
+    "randomimage_command_description",
+    "status_command_name",
+    "status_command_description",
+    "prompt_command_name",
+    "prompt_command_description",
+    "web_command_name",
+    "web_command_description",
+})
+
+
+def apply_config(cfg, initial=False):
+    """(Re)assign every config-derived global from cfg.
+
+    Called once at startup (initial=True) and by /reload. On reload it
+    also refreshes derived live state: OpenRouter headers (API key
+    rotation without restart), Ollama base URL, llm.jsonl settings, file
+    log level/rotation caps, style profile text, and bot presence is
+    re-applied by the caller. The live DB handle and registered slash
+    commands are intentionally untouched (see RESTART_REQUIRED_KEYS).
+    """
+    global BOT_STATUS, BOTNAME, CLEAR_COMMAND_DESCRIPTION, CLEAR_COMMAND_NAME
+    global CLEAR_COMMAND_TEXT, COOLDOWN_SECONDS, DEBUG_MAX_FILE_CHARS
+    global DEBUG_REACTION_EMOJI, DEBUG_RECORD_KEEP, DISCORD_TOKEN
+    global EXAMPLES_MAX_TOKENS, FACT_INPUT_CHARS, FALLBACK_MODEL
+    global LLM_DUMP_ENABLED, LOG_BACKUPS, LOG_DIR, LOG_FILE_LEVEL
+    global LOG_MAX_BYTES, MASTER_PROMPT, MAX_EXAMPLES, MAX_HISTORY
+    global MAX_OLLAMA_TOKENS, MEMORY_BUFFER_MAX_MSGS, MEMORY_BUFFER_TOKENS
+    global MEMORY_DB_PATH, MEMORY_ENGAGE_LOOKBACK, MEMORY_FACTS_ENABLED
+    global MEMORY_PEER_MAX_FACTS, MEMORY_PEER_MAX_USERS, MEMORY_PRUNE_KEEP
+    global MEMORY_RECALL_ENABLED, MEMORY_RECALL_LIMIT, MEMORY_SEMANTIC_RANK
+    global MEMORY_SUMMARY_CHUNK, MEMORY_SUMMARY_CHUNK_TOKENS
+    global MEMORY_SUMMARY_MIN_MSGS, MODEL, OLLAMA_AUTOLOAD, OLLAMA_BASE
+    global OLLAMA_MODEL, OLLAMA_TIMEOUT, OLLAMA_URL, OPENROUTER_API_KEY
+    global OPENROUTER_HEADERS, PROMPT_COMMAND_DESCRIPTION, PROMPT_COMMAND_NAME
+    global PROMPT_SYSTEM, RANDOMIMAGE_COMMAND_DESCRIPTION
+    global RANDOMIMAGE_COMMAND_NAME, RANDOMIMAGE_COMMAND_TEXT
+    global REPLY_CONTEXT_BEFORE, REPLY_CONTEXT_PARENT_CHARS
+    global REPLY_MAX_PARTS
+    global SEARCH_ENABLED, SEARCH_MAX_RESULTS, SEARCH_MAX_RETRIES
+    global SEARCH_SHORT_MESSAGE_WORDS, SEARCH_TIMEOUT, SEARCH_TRIGGERS
+    global STATUS_COMMAND_DESCRIPTION, STATUS_COMMAND_NAME
+    global STYLE_PROFILE_ENABLED, STYLE_PROFILE_MAX_CHARS, STYLE_PROFILE_PATH
+    global STYLE_PROFILE_TEXT, SUMMARY_INPUT_CHARS, SUMMARY_INTERVAL
+    global SUMMARY_MAX_RETRIES, SUMMARY_MAX_TOKENS, SUMMARY_MODEL
+    global SUMMARY_OLLAMA_CTX, SUMMARY_OLLAMA_MODEL, SUMMARY_OLLAMA_TIMEOUT
+    global SUMMARY_TEMPERATURE, SUMMARY_TIMEOUT, VISION_CACHE_MAX
+    global VISION_CACHE_TTL, VISION_MAX_BYTES, VISION_MAX_TOKENS
+    global VISION_MODEL, VISION_OLLAMA_CTX, VISION_OLLAMA_MODEL
+    global VISION_TEMPERATURE, VISION_TIMEOUT, WEB_COMMAND_DESCRIPTION
+    global WEB_COMMAND_NAME, config
+    config = cfg
+
+    # You can change those in config
+
+    DISCORD_TOKEN = cfg["discord_token"]
+
+    OPENROUTER_API_KEY = cfg["openrouter_api_key"]
+    MODEL = cfg.get("model", "openrouter/free")
+    FALLBACK_MODEL = cfg["fallback_model"]
+
+    MASTER_PROMPT = cfg["master_prompt"]
+    PROMPT_SYSTEM = cfg.get("prompt_system", "You are a helpful assistant.")
+
+    MAX_HISTORY = cfg["max_history"]
+    MAX_EXAMPLES = cfg["max_examples"]
+    EXAMPLES_MAX_TOKENS = cfg.get("examples_max_tokens", 1200)
+
+    OLLAMA_URL = cfg["ollama_url"]
+    OLLAMA_MODEL = cfg["ollama_model"]
+    MAX_OLLAMA_TOKENS = cfg["ollama_max_tokens"]
+    OLLAMA_TIMEOUT = cfg["ollama_timeout"]
+    OLLAMA_AUTOLOAD = cfg.get("ollama_autoload", False)
+
+    BOTNAME = cfg["botname"]
+    BOT_STATUS = cfg.get("bot_status", "online")
+
+    # ---- magnifying-glass debug (react 🔍 to a bot reply, get the full
+    # generation as a DM'd file) ----
+    DEBUG_REACTION_EMOJI = cfg.get("debug_reaction_emoji", "🔍")
+    DEBUG_MAX_FILE_CHARS = cfg.get("debug_max_file_chars", 200000)
+    DEBUG_RECORD_KEEP = cfg.get("debug_record_keep", 200)
+
+    # ---- persistent memory settings ----
+    MEMORY_DB_PATH = cfg.get("memory_db_path", "memory.db")
+    MEMORY_BUFFER_TOKENS = cfg.get("memory_buffer_tokens", 1500)
+    MEMORY_BUFFER_MAX_MSGS = cfg.get("memory_buffer_max_msgs", 30)
+    MEMORY_SUMMARY_CHUNK = cfg.get("memory_summary_chunk", 30)
+    MEMORY_ENGAGE_LOOKBACK = cfg.get("memory_engage_lookback", 30)
+    MEMORY_SUMMARY_CHUNK_TOKENS = cfg.get("memory_summary_chunk_tokens", 3000)
+    MEMORY_SUMMARY_MIN_MSGS = cfg.get("memory_summary_min_msgs", 10)
+    MEMORY_FACTS_ENABLED = cfg.get("memory_facts_enabled", True)
+    MEMORY_RECALL_ENABLED = cfg.get("memory_recall_enabled", True)
+    MEMORY_RECALL_LIMIT = cfg.get("memory_recall_limit", 3)
+    MEMORY_SEMANTIC_RANK = cfg.get("memory_semantic_rank", True)
+    MEMORY_PEER_MAX_USERS = cfg.get("memory_peer_max_users", 2)
+    MEMORY_PEER_MAX_FACTS = cfg.get("memory_peer_max_facts", 3)
+    # Replied-to context replacing keyword recall for out-of-window parents:
+    # how many preceding messages to include, and parent truncation budget.
+    REPLY_CONTEXT_BEFORE = cfg.get("reply_context_before", 3)
+    REPLY_CONTEXT_PARENT_CHARS = cfg.get("reply_context_max_chars", 500)
+    # Long replies split into at most this many Discord-sized chunks
+    # (fence-aware); the tail past the cap is cut with an ellipsis.
+    REPLY_MAX_PARTS = cfg.get("reply_max_parts", 3)
+    COOLDOWN_SECONDS = cfg.get("cooldown_seconds", 5)
+    MEMORY_PRUNE_KEEP = cfg.get("memory_prune_keep", 60)
+
+    # ---- background summarizer: separate local-first chain ----
+    # User tunes both model names via config. Local summary model is tried
+    # first (only when loaded); OpenRouter summary model is last resort.
+    SUMMARY_OLLAMA_MODEL = cfg.get("summary_ollama_model", "gemma3n:e4b")
+    SUMMARY_MODEL = cfg.get("summary_model", "openrouter/free")
+    SUMMARY_TEMPERATURE = cfg.get("summary_temperature", 0.2)
+    SUMMARY_MAX_TOKENS = cfg.get("summary_max_tokens", 800)
+    SUMMARY_INPUT_CHARS = cfg.get("summary_input_chars", 500)
+    FACT_INPUT_CHARS = cfg.get("fact_input_chars", 300)
+    SUMMARY_OLLAMA_TIMEOUT = cfg.get("summary_ollama_timeout", 60)
+    SUMMARY_TIMEOUT = cfg.get("summary_timeout", 60)
+    SUMMARY_MAX_RETRIES = cfg.get("summary_max_retries", 1)
+    SUMMARY_INTERVAL = cfg.get("summary_interval", 300)
+    SUMMARY_OLLAMA_CTX = cfg.get("summary_ollama_ctx", 2048)
+
+    # ---- vision chain: separate models, local-first like summaries ----
+    # User tunes both model names via config. Only the FIRST image found is
+    # ever described (own upload, link in text, or replied-to message).
+    VISION_OLLAMA_MODEL = cfg.get("vision_ollama_model", "qwen2.5vl:3b")
+    VISION_MODEL = cfg.get("vision_model", "openrouter/free")
+    VISION_TEMPERATURE = cfg.get("vision_temperature", 0.2)
+    VISION_MAX_TOKENS = cfg.get("vision_max_tokens", 1200)
+    VISION_OLLAMA_CTX = cfg.get("vision_ollama_ctx", 8192)
+    VISION_TIMEOUT = cfg.get("vision_timeout", 90)
+    VISION_MAX_BYTES = cfg.get("vision_max_bytes", 10 * 1024 * 1024)
+    VISION_CACHE_TTL = cfg.get("vision_cache_ttl_days", 7) * 86400
+    VISION_CACHE_MAX = cfg.get("vision_cache_max", 200)
+
+    # ---- static style profile (hand-reviewed persona blurb) ----
+    STYLE_PROFILE_PATH = cfg.get("style_profile_path", "style_profile.txt")
+    STYLE_PROFILE_ENABLED = cfg.get("style_profile_enabled", True)
+    STYLE_PROFILE_MAX_CHARS = cfg.get("style_profile_max_chars", 2000)
+    STYLE_PROFILE_TEXT = _load_style_profile()
+
+    # ---- debug logging: terminal stays concise, files get everything ----
+    LOG_DIR = cfg.get("log_dir", "logs")
+    LOG_FILE_LEVEL = cfg.get("log_file_level", "DEBUG")
+    LOG_MAX_BYTES = cfg.get("log_max_bytes", 5242880)
+    LOG_BACKUPS = cfg.get("log_backups", 3)
+    LLM_DUMP_ENABLED = cfg.get("llm_dump_enabled", True)
+
+    CLEAR_COMMAND_NAME = cfg["clear_command_name"]
+    CLEAR_COMMAND_DESCRIPTION = cfg["clear_command_description"]
+    CLEAR_COMMAND_TEXT = cfg["clear_command_text"]
+    RANDOMIMAGE_COMMAND_NAME = cfg["randomimage_command_name"]
+    RANDOMIMAGE_COMMAND_DESCRIPTION = cfg["randomimage_command_description"]
+    RANDOMIMAGE_COMMAND_TEXT = cfg["randomimage_command_text"]
+    STATUS_COMMAND_NAME = cfg["status_command_name"]
+    STATUS_COMMAND_DESCRIPTION = cfg["status_command_description"]
+    PROMPT_COMMAND_NAME = cfg["prompt_command_name"]
+    PROMPT_COMMAND_DESCRIPTION = cfg["prompt_command_description"]
+    WEB_COMMAND_NAME = cfg.get("web_command_name", "web")
+    WEB_COMMAND_DESCRIPTION = cfg.get(
+        "web_command_description", "Search the web, no AI involved")
+
+    SEARCH_ENABLED = cfg.get("search_enabled", True)
+    SEARCH_MAX_RESULTS = cfg.get("search_max_results", 4)
+    # max words in the user message before we stop gluing on context
+    SEARCH_SHORT_MESSAGE_WORDS = cfg.get("search_short_message_words", 5)
+    SEARCH_TIMEOUT = cfg.get("search_timeout", 15)
+    SEARCH_MAX_RETRIES = cfg.get("search_max_retries", 3)
+    SEARCH_TRIGGERS = tuple(cfg.get("search_triggers", [
+        "?",
+        "latest",
+        "news",
+        "today",
+        "who is",
+        "what is",
+        "when did",
+        "where is",
+        "price",
+        "weather",
+        "score",
+        "release",
+    ]))
+
+    # Derived from the configured ollama_url above — /api/ps and /api/embed
+    # follow whatever host:port is configured, no second hardcoded URL.
+    OLLAMA_BASE = mem_config.ollama_base(OLLAMA_URL)
+
+    OPENROUTER_HEADERS = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost",
+        "X-Title": "Discord RAG Bot",
+    }
+
+    if not initial:
+        # Refresh live derived state (startup path builds these below).
+        mem_llmlog.configure(LOG_DIR, LLM_DUMP_ENABLED,
+                             max_bytes=LOG_MAX_BYTES, backups=LOG_BACKUPS)
+        handler = globals().get("_file_handler")
+        if handler is not None:
+            try:
+                handler.setLevel(getattr(
+                    logging, str(LOG_FILE_LEVEL).upper(), logging.DEBUG))
+                handler.maxBytes = int(LOG_MAX_BYTES)
+                handler.backupCount = int(LOG_BACKUPS)
+            except Exception:
+                log.warning("log handler reconfigure failed")
+
+# (All config-derived globals live in apply_config() above.)
 # You can change those in config
-
-DISCORD_TOKEN = config["discord_token"]
-
-OPENROUTER_API_KEY = config["openrouter_api_key"]
-MODEL = config.get("model", "openrouter/free")
-FALLBACK_MODEL = config["fallback_model"]
-
-MASTER_PROMPT = config["master_prompt"]
-PROMPT_SYSTEM = config.get("prompt_system", "You are a helpful assistant.")
-
-MAX_HISTORY = config["max_history"]
-MAX_EXAMPLES = config["max_examples"]
-EXAMPLES_MAX_TOKENS = config.get("examples_max_tokens", 1200)
-
-OLLAMA_URL = config["ollama_url"]
-OLLAMA_MODEL = config["ollama_model"]
-MAX_OLLAMA_TOKENS = config["ollama_max_tokens"]
-OLLAMA_TIMEOUT = config["ollama_timeout"]
-OLLAMA_AUTOLOAD = config.get("ollama_autoload", False)
-
-BOTNAME = config["botname"]
-BOT_STATUS = config.get("bot_status", "online")
 
 # Map for the bot_status config value. Parsed in on_ready; unknown
 # values fall back to online with a warning.
@@ -89,59 +287,7 @@ BOT_STATUS_MAP = {
     "offline": discord.Status.invisible,
 }
 
-# ---- persistent memory settings ----
-MEMORY_DB_PATH = config.get("memory_db_path", "memory.db")
-MEMORY_BUFFER_TOKENS = config.get("memory_buffer_tokens", 1500)
-MEMORY_BUFFER_MAX_MSGS = config.get("memory_buffer_max_msgs", 30)
-MEMORY_SUMMARY_CHUNK = config.get("memory_summary_chunk", 30)
-MEMORY_ENGAGE_LOOKBACK = config.get("memory_engage_lookback", 30)
-MEMORY_SUMMARY_CHUNK_TOKENS = config.get("memory_summary_chunk_tokens", 3000)
-MEMORY_SUMMARY_MIN_MSGS = config.get("memory_summary_min_msgs", 10)
-MEMORY_FACTS_ENABLED = config.get("memory_facts_enabled", True)
-MEMORY_RECALL_ENABLED = config.get("memory_recall_enabled", True)
-MEMORY_RECALL_LIMIT = config.get("memory_recall_limit", 3)
-MEMORY_SEMANTIC_RANK = config.get("memory_semantic_rank", True)
-MEMORY_PEER_MAX_USERS = config.get("memory_peer_max_users", 2)
-MEMORY_PEER_MAX_FACTS = config.get("memory_peer_max_facts", 3)
-# Replied-to context replacing keyword recall for out-of-window parents:
-# how many preceding messages to include, and parent truncation budget.
-REPLY_CONTEXT_BEFORE = config.get("reply_context_before", 3)
-REPLY_CONTEXT_PARENT_CHARS = config.get("reply_context_max_chars", 500)
-COOLDOWN_SECONDS = config.get("cooldown_seconds", 5)
-MEMORY_PRUNE_KEEP = config.get("memory_prune_keep", 60)
-
-# ---- background summarizer: separate local-first chain ----
-# User tunes both model names via config. Local summary model is tried
-# first (only when loaded); OpenRouter summary model is last resort.
-SUMMARY_OLLAMA_MODEL = config.get("summary_ollama_model", "gemma3n:e4b")
-SUMMARY_MODEL = config.get("summary_model", "openrouter/free")
-SUMMARY_TEMPERATURE = config.get("summary_temperature", 0.2)
-SUMMARY_MAX_TOKENS = config.get("summary_max_tokens", 800)
-SUMMARY_INPUT_CHARS = config.get("summary_input_chars", 500)
-FACT_INPUT_CHARS = config.get("fact_input_chars", 300)
-SUMMARY_OLLAMA_TIMEOUT = config.get("summary_ollama_timeout", 60)
-SUMMARY_TIMEOUT = config.get("summary_timeout", 60)
-SUMMARY_MAX_RETRIES = config.get("summary_max_retries", 1)
-SUMMARY_INTERVAL = config.get("summary_interval", 300)
-SUMMARY_OLLAMA_CTX = config.get("summary_ollama_ctx", 2048)
-
-# ---- vision chain: separate models, local-first like summaries ----
-# User tunes both model names via config. Only the FIRST image found is
-# ever described (own upload, link in text, or replied-to message).
-VISION_OLLAMA_MODEL = config.get("vision_ollama_model", "qwen2.5vl:3b")
-VISION_MODEL = config.get("vision_model", "openrouter/free")
-VISION_TEMPERATURE = config.get("vision_temperature", 0.2)
-VISION_MAX_TOKENS = config.get("vision_max_tokens", 1200)
-VISION_OLLAMA_CTX = config.get("vision_ollama_ctx", 8192)
-VISION_TIMEOUT = config.get("vision_timeout", 90)
-VISION_MAX_BYTES = config.get("vision_max_bytes", 10 * 1024 * 1024)
-VISION_CACHE_TTL = config.get("vision_cache_ttl_days", 7) * 86400
-VISION_CACHE_MAX = config.get("vision_cache_max", 200)
-
-# ---- static style profile (hand-reviewed persona blurb) ----
-STYLE_PROFILE_PATH = config.get("style_profile_path", "style_profile.txt")
-STYLE_PROFILE_ENABLED = config.get("style_profile_enabled", True)
-STYLE_PROFILE_MAX_CHARS = config.get("style_profile_max_chars", 2000)
+# ---- persistent memory settings (see apply_config) ----
 
 
 def _load_style_profile():
@@ -157,14 +303,10 @@ def _load_style_profile():
         return ""
 
 
-STYLE_PROFILE_TEXT = _load_style_profile()
+STYLE_PROFILE_TEXT = None  # filled by apply_config below
+apply_config(config, initial=True)
 
 # ---- debug logging: terminal stays concise, files get everything ----
-LOG_DIR = config.get("log_dir", "logs")
-LOG_FILE_LEVEL = config.get("log_file_level", "DEBUG")
-LOG_MAX_BYTES = config.get("log_max_bytes", 5242880)
-LOG_BACKUPS = config.get("log_backups", 3)
-LLM_DUMP_ENABLED = config.get("llm_dump_enabled", True)
 
 try:
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -190,20 +332,14 @@ mem_store.init_db()
 _last_call = {}
 _channel_locks = defaultdict(asyncio.Lock)
 _openrouter_failures = 0
+# magnifying-glass debug: bot message id -> normalized generation record
+# (FIFO-capped; restarts just mean old messages get an X reaction).
+# _pending_debug holds the in-flight record keyed by channel id while the
+# channel lock is held, so concurrent channels can't swap each other's data.
+_debug_records = OrderedDict()
+_pending_debug = {}
 
-CLEAR_COMMAND_NAME = config["clear_command_name"]
-CLEAR_COMMAND_DESCRIPTION = config["clear_command_description"]
-CLEAR_COMMAND_TEXT = config["clear_command_text"]
-RANDOMIMAGE_COMMAND_NAME = config["randomimage_command_name"]
-RANDOMIMAGE_COMMAND_DESCRIPTION = config["randomimage_command_description"]
-RANDOMIMAGE_COMMAND_TEXT = config["randomimage_command_text"]
-STATUS_COMMAND_NAME = config["status_command_name"]
-STATUS_COMMAND_DESCRIPTION = config["status_command_description"]
-PROMPT_COMMAND_NAME = config["prompt_command_name"]
-PROMPT_COMMAND_DESCRIPTION = config["prompt_command_description"]
-WEB_COMMAND_NAME = config.get("web_command_name", "web")
-WEB_COMMAND_DESCRIPTION = config.get(
-    "web_command_description", "Search the web, no AI involved")
+# (Slash-command names/texts live in apply_config above.)
 
 # Don't touch those unless you know what you are doing
 
@@ -212,17 +348,9 @@ DIM = 768  # nomic-embed-text embedding size
 EMBED_MODEL = "nomic-embed-text"
 ASSISTANT_NAME = "Assistant"  # I would leave it as it is or it can cause issues with output quality
 
-# Derived from the configured ollama_url above — /api/ps and /api/embed
-# follow whatever host:port is configured, no second hardcoded URL.
-OLLAMA_BASE = mem_config.ollama_base(OLLAMA_URL)
+# (OLLAMA_BASE / OPENROUTER_HEADERS are derived in apply_config above.)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_HEADERS = {
-    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-    "Content-Type": "application/json",
-    "HTTP-Referer": "http://localhost",
-    "X-Title": "Discord RAG Bot",
-}
 
 MAX_RETRIES = 5       # OpenRouter attempts per model
 REQUEST_TIMEOUT = 120  # seconds per OpenRouter request
@@ -442,31 +570,7 @@ def retrieve_examples(channel_id, user_message, limit=MAX_EXAMPLES):
 # ============================================================
 # WEB SEARCH
 # ============================================================
-
-SEARCH_ENABLED = config.get("search_enabled", True)
-SEARCH_MAX_RESULTS = config.get("search_max_results", 4)
-
-# max words in the user message before we stop gluing on context
-SEARCH_SHORT_MESSAGE_WORDS = config.get("search_short_message_words", 5)
-
-SEARCH_TIMEOUT = config.get("search_timeout", 15)
-
-SEARCH_MAX_RETRIES = config.get("search_max_retries", 3)
-
-SEARCH_TRIGGERS = tuple(config.get("search_triggers", [
-    "?",
-    "latest",
-    "news",
-    "today",
-    "who is",
-    "what is",
-    "when did",
-    "where is",
-    "price",
-    "weather",
-    "score",
-    "release",
-]))
+# (SEARCH_* live in apply_config above.)
 
 DDG_HEADERS = {
     "User-Agent": (
@@ -995,7 +1099,7 @@ async def startup_model_check():
 
 async def ollama_chat(messages, model=None, temperature=0.9,
                       num_ctx=None, timeout=None, purpose="chat",
-                      num_predict=None):
+                      num_predict=None, debug_key=None):
     resolved_model = model or OLLAMA_MODEL
     options = {
         "temperature": temperature,
@@ -1032,7 +1136,12 @@ async def ollama_chat(messages, model=None, temperature=0.9,
                      latency_ms, "ok" if r.status_code == 200 else "http-error")
 
         if r.status_code == 200:
-            return strip_thinking(body["message"]["content"])
+            text = strip_thinking(body["message"]["content"])
+            if debug_key is not None:
+                _pending_debug[debug_key] = mem_debug.normalize_record(
+                    "ollama", resolved_model, payload, body, latency_ms,
+                    status="ok")
+            return text
 
         log.warning("Ollama HTTP %s", r.status_code)
 
@@ -1057,7 +1166,8 @@ def _retry_delay(attempt, retry_after=None):
 
 async def openrouter_chat(messages, model, tag_as_fallback=False,
                           temperature=0.9, max_tokens=None,
-                          timeout=None, max_retries=None, purpose="chat"):
+                          timeout=None, max_retries=None, purpose="chat",
+                          debug_key=None):
     """
     One OpenRouter request with retries.
     Returns the reply text, or None so the caller can fall back.
@@ -1144,6 +1254,11 @@ async def openrouter_chat(messages, model, tag_as_fallback=False,
                 reply = f"-# [fallback: {model}]\n{reply}"
 
             log.info("[%s] Request succeeded.", model)
+            if debug_key is not None:
+                _pending_debug[debug_key] = mem_debug.normalize_record(
+                    "openrouter", model, payload, data,
+                    int((time.time() - t0) * 1000), status="ok",
+                    fallback=tag_as_fallback, attempts=attempt)
             return reply
 
         if r.status_code in RETRYABLE_CODES:
@@ -1174,28 +1289,33 @@ async def openrouter_chat(messages, model, tag_as_fallback=False,
     return None
 
 
-async def generate_reply(messages, purpose="chat"):
+async def generate_reply(messages, purpose="chat", debug_key=None):
     """
     Fallback chain: local Ollama → OpenRouter primary → OpenRouter fallback.
     Returns the reply text, or None if everything failed.
+    When debug_key is given, the winning backend stashes a normalized
+    record in _pending_debug[debug_key] for the 🔍 reaction handler.
     """
     if await asyncio.to_thread(is_ollama_model_loaded):
         log.info("[generate] Using loaded Ollama model")
 
-        reply = await ollama_chat(messages, purpose=purpose)
+        reply = await ollama_chat(messages, purpose=purpose,
+                                  debug_key=debug_key)
         if reply:
             return reply
 
     log.info("[generate] Using OpenRouter (%s)", MODEL)
 
-    reply = await openrouter_chat(messages, MODEL, purpose=purpose)
+    reply = await openrouter_chat(messages, MODEL, purpose=purpose,
+                                  debug_key=debug_key)
     if reply:
         return reply
 
     log.info("[generate] Using OpenRouter fallback (%s)", FALLBACK_MODEL)
 
     return await openrouter_chat(messages, FALLBACK_MODEL,
-                                 tag_as_fallback=True, purpose=purpose)
+                                 tag_as_fallback=True, purpose=purpose,
+                                 debug_key=debug_key)
 
 
 async def summary_generate(messages, purpose="summary"):
@@ -2247,6 +2367,63 @@ async def status(interaction: discord.Interaction):
     await interaction.followup.send(text)
 
 
+@tree.command(name="reload",
+              description="Reload config.json without restarting (admin only)")
+async def reload_config_cmd(interaction: discord.Interaction):
+    """Re-read config.json and apply it live. Fail-soft: parse errors or
+    mid-reload crashes keep the old config. Keys in RESTART_REQUIRED_KEYS
+    are reported instead of applied (DB handle / command registrations /
+    token can't move at runtime)."""
+    await interaction.response.defer(ephemeral=True)
+    try:
+        if interaction.guild is None:
+            await interaction.followup.send(
+                "Run /reload in a server — it needs admin rights.")
+            return
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if perms is None or not getattr(perms, "administrator", False):
+            await interaction.followup.send(
+                "Administrator permission required.")
+            return
+        try:
+            new = mem_config.load_config("config.json")
+        except Exception as e:
+            log.warning("[bot] reload parse failed: %s", e)
+            await interaction.followup.send(
+                f"config.json failed to parse, keeping old config: {e}")
+            return
+        changed = mem_config.diff_configs(config, new)
+        if not changed:
+            await interaction.followup.send(
+                "No changes — config is already current.")
+            return
+        apply_config(new)
+        needs_restart = sorted(set(changed) & RESTART_REQUIRED_KEYS)
+        live = sorted(set(changed) - RESTART_REQUIRED_KEYS)
+        # bot_status may have changed — re-apply presence
+        try:
+            await client.change_presence(status=BOT_STATUS_MAP.get(
+                str(BOT_STATUS).lower(), discord.Status.online))
+        except Exception:
+            log.exception("presence re-apply failed")
+        log.info("[bot] config reloaded by %s: live=%s restart=%s",
+                 interaction.user, live, needs_restart)
+        lines = ["**Config reloaded.**"]
+        if live:
+            lines.append("Live now: " + ", ".join(f"`{k}`" for k in live))
+        if needs_restart:
+            lines.append("Needs restart: " + ", ".join(
+                f"`{k}`" for k in needs_restart))
+        await interaction.followup.send("\n".join(lines))
+    except Exception:
+        log.exception("reload failed")
+        try:
+            await interaction.followup.send(
+                "Reload failed, old config kept.")
+        except Exception:
+            pass
+
+
 @tree.command(
     name=RANDOMIMAGE_COMMAND_NAME,
     description=RANDOMIMAGE_COMMAND_DESCRIPTION,
@@ -2582,16 +2759,38 @@ async def on_message(message):
                     },
                 ]
 
-                reply = await generate_reply(messages)
+                # Drop any stale in-flight record (e.g. a generation that
+                # raised before sending) so the stash below always belongs
+                # to this message.
+                _pending_debug.pop(message.channel.id, None)
+                reply = await generate_reply(
+                    messages, debug_key=message.channel.id)
 
                 # FINAL SAFETY NET
                 if reply is None:
                     reply = "All models are currently unavailable 💀"
 
-                if len(reply) > 1900:
-                    reply = reply[:1900] + "..."
+                # Long replies split into ≤ REPLY_MAX_PARTS Discord-sized
+                # chunks (fence-aware); the first goes as the reply so
+                # only one notification fires, the rest as follow-ups.
+                chunks = mem_split.split_message(
+                    reply, max_parts=REPLY_MAX_PARTS)
+                if len(chunks) > 1:
+                    log.info("[reply] split into %d parts (%d chars)",
+                             len(chunks), len(reply))
+                sent = await message.reply(chunks[0])
+                for extra in chunks[1:]:
+                    await message.channel.send(extra)
 
-                sent = await message.reply(reply)
+                # Link the winning generation to this message for 🔍.
+                # Safety-net text has no record (backends only stash on
+                # success), so such messages correctly get an X reaction.
+                rec = _pending_debug.pop(message.channel.id, None)
+                if rec is not None:
+                    rec["reply"] = reply
+                    _debug_records[sent.id] = rec
+                    while len(_debug_records) > DEBUG_RECORD_KEEP:
+                        _debug_records.popitem(last=False)
 
                 await asyncio.to_thread(
                     add_message,
@@ -2610,6 +2809,71 @@ async def on_message(message):
                 await message.reply("Something broke on my side 💀")
             except Exception:
                 pass
+
+
+@client.event
+async def on_raw_reaction_add(payload):
+    """Magnifying-glass debug: DM the reactor the full generation record.
+
+    Raw event (no message cache needed). Only the bot's own replies with
+    a stored record qualify; anything else gets an X reaction so no
+    special permissions are required. Fail-soft: debug must never break
+    normal operation.
+    """
+    try:
+        if str(payload.emoji) != DEBUG_REACTION_EMOJI:
+            return
+        if client.user and payload.user_id == client.user.id:
+            return
+        member = payload.member
+        if member is not None and getattr(member, "bot", False):
+            return
+        user = client.get_user(payload.user_id)
+        if user is None:
+            try:
+                user = await client.fetch_user(payload.user_id)
+            except Exception:
+                return
+        if user.bot:
+            return
+        rec = _debug_records.get(payload.message_id)
+        channel = client.get_channel(payload.channel_id)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(payload.channel_id)
+            except Exception:
+                return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except (discord.NotFound, discord.Forbidden):
+            return
+        except Exception:
+            log.exception("debug reaction fetch failed")
+            return
+        if client.user and message.author.id != client.user.id:
+            return
+        if rec is None:
+            try:
+                await message.add_reaction("❌")
+            except Exception:
+                pass
+            return
+        text = mem_debug.format_debug_record(
+            rec, max_chars=DEBUG_MAX_FILE_CHARS)
+        try:
+            await user.send(file=discord.File(
+                io.BytesIO(text.encode("utf-8")),
+                filename=f"hisami-debug-{payload.message_id}.md"))
+        except discord.Forbidden:
+            try:
+                await channel.send(
+                    f"<@{payload.user_id}> I couldn't DM you the debug "
+                    "file. Enable DMs from server members.",
+                    delete_after=15)
+            except Exception:
+                pass
+    except Exception:
+        log.exception("debug reaction failed")
 
 
 client.run(DISCORD_TOKEN)

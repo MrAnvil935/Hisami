@@ -66,6 +66,10 @@
   // and max chars of the parent itself in the replacement block.
   "reply_context_before": 3,
   "reply_context_max_chars": 500,
+  // Long replies split into at most this many Discord-sized chunks
+  // (fence-aware, first chunk sent as the reply); the tail past the
+  // cap is cut with an ellipsis. 1 restores the old truncate behavior.
+  "reply_max_parts": 3,
   // Per-user cooldown between bot replies (seconds). Replies inside the
   // window get a "slow down" nudge instead of a generation.
   "cooldown_seconds": 5,
@@ -141,6 +145,16 @@
   // Per-call full request/response dump to logs/llm.jsonl (headers and
   // image bytes redacted). Set false to keep only bot.log.
   "llm_dump_enabled": true,
+  // Emoji that triggers the debug DM: react with it to a bot reply and
+  // the full generation (prompt, reasoning if present, model, usage)
+  // is DM'd to you as a file. Anyone can use it.
+  "debug_reaction_emoji": "🔍",
+  // Max chars of the DM'd debug file (prompt cut first, header/reply
+  // always survive). Discord uploads allow far more; this just caps RAM.
+  "debug_max_file_chars": 200000,
+  // How many recent bot replies keep their generation record. Older
+  // messages (or pre-restart ones) get an X reaction instead.
+  "debug_record_keep": 200,
 
   // Recent messages /lobotomy forgets (unsticks looping models).
   // Summaries and facts are intentionally preserved.

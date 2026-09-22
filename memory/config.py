@@ -55,6 +55,26 @@ def load_config(path="config.json"):
         return json.loads(strip_json_comments(f.read()))
 
 
+def diff_configs(old, new):
+    """Sorted keys whose values differ between two config dicts.
+
+    Missing-vs-present counts as a change. Pure function (no I/O) so
+    it is unit-testable; used by /reload to report what changed.
+    """
+    old = old if isinstance(old, dict) else {}
+    new = new if isinstance(new, dict) else {}
+    changed = []
+    for key in set(old) | set(new):
+        try:
+            same = (old.get(key) == new.get(key)
+                    and (key in old) == (key in new))
+        except Exception:
+            same = False
+        if not same:
+            changed.append(key)
+    return sorted(changed)
+
+
 DEFAULT_OLLAMA_BASE = "http://localhost:11434"
 
 
