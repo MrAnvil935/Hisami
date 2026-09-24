@@ -417,6 +417,7 @@ def _history_compat(channel_id):
             "id": r["msg_id"],
             "author": r["author_name"],
             "author_id": r.get("author_id", ""),
+            "display_name": r.get("display_name", ""),
             "role": r.get("role", "user"),
             "content": r.get("content", ""),
             "reply_to": r.get("reply_to"),
@@ -427,23 +428,34 @@ def _history_compat(channel_id):
 
 
 def add_message(channel_id, message_id, author, role, content, reply_to=None,
-                author_id="", attachments=None):
+                author_id="", attachments=None, display_name=""):
     try:
         mem_store.add_message(
             channel_id, message_id, author_id, author,
             role, content, reply_to,
             attachments=attachments,
+            display_name=display_name,
         )
     except TypeError:
-        # Stale memory/store.py without the attachments parameter
-        # (partial deploy) — store the message without media metadata
-        # rather than dropping it entirely.
-        log.warning("add_message attachments unsupported, "
-                    "memory/store.py is outdated — sync it")
-        mem_store.add_message(
-            channel_id, message_id, author_id, author,
-            role, content, reply_to,
-        )
+        try:
+            # Stale memory/store.py without the display_name parameter
+            # (partial deploy) — store without it rather than dropping
+            # the message entirely.
+            mem_store.add_message(
+                channel_id, message_id, author_id, author,
+                role, content, reply_to,
+                attachments=attachments,
+            )
+        except TypeError:
+            # Stale memory/store.py without the attachments parameter
+            # (partial deploy) — store the message without media metadata
+            # rather than dropping it entirely.
+            log.warning("add_message attachments unsupported, "
+                        "memory/store.py is outdated — sync it")
+            mem_store.add_message(
+                channel_id, message_id, author_id, author,
+                role, content, reply_to,
+            )
     # prune runs inside to_thread callers; keep it cheap: prune async occasionally
     try:
         if mem_store.get_message_count(channel_id) > MEMORY_PRUNE_KEEP + 20:
@@ -945,6 +957,7 @@ async def build_prompt(channel_id, user_message, username, author_id="",
                 "id": row["msg_id"],
                 "author": row.get("author_name", "?"),
                 "author_id": row.get("author_id", ""),
+                "display_name": row.get("display_name", ""),
                 "role": row.get("role", "user"),
                 "content": row.get("content", ""),
                 "reply_to": row.get("reply_to"),
@@ -1542,6 +1555,7 @@ def _normalize_fetched(author, content, message_id, attachments=()):
         "author_id": str(getattr(author, "id", "")),
         "author_name": str(author),
         "author": str(author),
+        "display_name": str(getattr(author, "display_name", "") or ""),
         "role": "assistant" if is_bot else "user",
         "content": str(content or ""),
         "reply_to": None,
@@ -1577,6 +1591,7 @@ async def build_reply_context_block(channel_id, message, target, window_ids):
         if parent is not None:
             parent = {
                 "author_name": parent.get("author_name", "?"),
+                "display_name": parent.get("display_name", ""),
                 "content": parent.get("content", ""),
             }
             previous = await asyncio.to_thread(
@@ -1591,7 +1606,10 @@ async def build_reply_context_block(channel_id, message, target, window_ids):
             t_author = getattr(target, "author", None)
             t_content = getattr(target, "content", "")
             if t_author is not None and str(t_content or "").strip():
-                parent = {"author_name": str(t_author), "content": t_content}
+                parent = {"author_name": str(t_author),
+                          "display_name": str(getattr(
+                              t_author, "display_name", "") or ""),
+                          "content": t_content}
                 hist = [m async for m in message.channel.history(
                     before=target, limit=REPLY_CONTEXT_BEFORE)]
                 previous = []
@@ -1610,7 +1628,8 @@ async def build_reply_context_block(channel_id, message, target, window_ids):
                         "assistant" if row["role"] == "assistant" else "user",
                         row["content"], None, row["author_id"],
                         mem_vision.classify_attachments(
-                            getattr(hm, "attachments", [])))
+                            getattr(hm, "attachments", [])),
+                        row.get("display_name", ""))
                 await asyncio.to_thread(
                     add_message, channel_id,
                     getattr(target, "id", parent_id), str(t_author),
@@ -1618,7 +1637,8 @@ async def build_reply_context_block(channel_id, message, target, window_ids):
                     else "user",
                     t_content, None, str(getattr(t_author, "id", "")),
                     mem_vision.classify_attachments(
-                        getattr(target, "attachments", [])))
+                        getattr(target, "attachments", [])),
+                    str(getattr(t_author, "display_name", "") or ""))
         except Exception:
             log.exception("reply context Discord fetch failed")
             return ""
@@ -2651,6 +2671,7 @@ async def on_message(message):
         reply_to,
         str(message.author.id),
         msg_attachments,
+        str(getattr(message.author, "display_name", "") or ""),
     )
 
     if (client.user not in message.mentions
@@ -2801,6 +2822,9 @@ async def on_message(message):
                     reply,
                     message.id,
                     str(client.user.id) if client.user else "assistant",
+                    None,
+                    str(getattr(client.user, "display_name", "")
+                        or BOTNAME),
                 )
 
         except Exception:

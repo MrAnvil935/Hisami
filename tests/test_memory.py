@@ -69,6 +69,33 @@ class StoreTest(TempDBMixin, unittest.TestCase):
         rows = mem_store.get_recent("c9", 5)
         self.assertEqual(rows[0]["author_id"], "u1")
 
+    def test_display_name_round_trip(self):
+        mem_store.add_message("cd", 1, "u1", "alice", "user", "hello",
+                              display_name="Ali")
+        mem_store.add_message("cd", 2, "u2", "bob", "user", "yo")
+        rows = mem_store.get_recent("cd", 5)
+        self.assertEqual(rows[0]["display_name"], "Ali")
+        self.assertEqual(rows[1]["display_name"], "")
+        got = mem_store.get_messages_by_ids("cd", [1])
+        self.assertEqual(got[1]["display_name"], "Ali")
+        before = mem_store.get_messages_before("cd", 2, limit=1)
+        self.assertEqual(before[0]["display_name"], "Ali")
+
+    def test_display_name_migration(self):
+        import sqlite3
+        con = sqlite3.connect(self.path)
+        try:
+            con.execute("ALTER TABLE messages DROP COLUMN display_name")
+            con.commit()
+        finally:
+            con.close()
+        # old DB without the column migrates in place
+        mem_store.init_db()
+        mem_store.add_message("cm", 1, "u1", "alice", "user", "hi",
+                              display_name="Ali")
+        rows = mem_store.get_recent("cm", 5)
+        self.assertEqual(rows[0]["display_name"], "Ali")
+
     def test_get_messages_by_ids(self):
         mem_store.add_message("cb", 1, "u1", "alice", "user", "first")
         mem_store.add_message("cb", 2, "u2", "bob", "user", "second",
@@ -245,6 +272,35 @@ class BufferTest(TempDBMixin, unittest.TestCase):
         self.assertIn("[image: p.png]", out)
         self.assertIn("replying to bob", out)
 
+    def test_author_label_brackets_display(self):
+        self.assertEqual(
+            mem_buffer.author_label(
+                {"author": "alice", "display_name": "Ali"}),
+            "alice [Ali]")
+        # DB-row shape uses author_name
+        self.assertEqual(
+            mem_buffer.author_label(
+                {"author_name": "bob", "display_name": "Bobby"}),
+            "bob [Bobby]")
+
+    def test_author_label_skips_redundant(self):
+        self.assertEqual(
+            mem_buffer.author_label({"author": "alice"}), "alice")
+        self.assertEqual(
+            mem_buffer.author_label(
+                {"author": "alice", "display_name": ""}), "alice")
+        self.assertEqual(
+            mem_buffer.author_label(
+                {"author": "alice", "display_name": "alice"}), "alice")
+
+    def test_format_history_line_with_display(self):
+        out = mem_buffer.format_history_line(
+            {"author": "alice", "display_name": "Ali",
+             "content": "hi", "reply_to": 5},
+            {"author": "bob", "display_name": "Bobby",
+             "content": "yo"})
+        self.assertEqual(out, "alice [Ali] (replying to bob [Bobby]: yo): hi")
+
 
 class RecallTest(TempDBMixin, unittest.TestCase):
     def test_fts_recall(self):
@@ -369,6 +425,15 @@ class RecallTest(TempDBMixin, unittest.TestCase):
         self.assertEqual(
             mem_recall.format_reply_context(
                 {"author_name": "a", "content": "   "}, prev), "")
+
+    def test_format_reply_context_display_names(self):
+        parent = {"author_name": "alice", "display_name": "Ali",
+                  "content": "is this real?"}
+        prev = [{"author_name": "bob", "display_name": "Bobby",
+                 "content": "look"}]
+        out = mem_recall.format_reply_context(parent, prev)
+        self.assertIn("alice [Ali]: is this real?", out)
+        self.assertIn("bob [Bobby]: look", out)
 
     def test_referenced_users_mention(self):
         msgs = [

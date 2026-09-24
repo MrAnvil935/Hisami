@@ -7,6 +7,7 @@ tokens so user input can never break the MATCH syntax.
 import re
 import sqlite3
 
+from . import buffer as mem_buffer
 from . import store
 
 _WORD_RE = re.compile(r"[a-z0-9]{2,}")
@@ -272,7 +273,7 @@ def format_reply_context(parent, previous, parent_chars=500, ctx_chars=300):
         return ""
     lines = [
         "Replied-to message:",
-        f"{parent.get('author_name', '?')}: "
+        f"{mem_buffer.author_label(parent)}: "
         f"{str(parent.get('content') or '')[:parent_chars]}",
     ]
     ctx = [m for m in (previous or [])
@@ -280,7 +281,7 @@ def format_reply_context(parent, previous, parent_chars=500, ctx_chars=300):
     if ctx:
         lines.append("Previous context:")
         lines.extend(
-            f"{m.get('author_name', '?')}: "
+            f"{mem_buffer.author_label(m)}: "
             f"{str(m.get('content') or '')[:ctx_chars]}"
             for m in ctx
         )

@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS messages (
     msg_id      INTEGER NOT NULL,
     author_id   TEXT NOT NULL DEFAULT '',
     author_name TEXT NOT NULL DEFAULT '',
+    display_name TEXT NOT NULL DEFAULT '',
     role        TEXT NOT NULL DEFAULT 'user',
     content     TEXT NOT NULL DEFAULT '',
     reply_to    INTEGER,
@@ -96,6 +97,8 @@ def init_db(path: str | None = None):
         cols = [r[1] for r in con.execute("PRAGMA table_info(messages)")]
         if "attachments" not in cols:
             con.execute("ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
+        if "display_name" not in cols:
+            con.execute("ALTER TABLE messages ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
         for table in ("summaries", "user_facts"):
             tcols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
             if "embedding" not in tcols:
@@ -108,7 +111,8 @@ def init_db(path: str | None = None):
 # ---------------- messages ----------------
 
 def add_message(channel_id, msg_id, author_id, author_name, role,
-                content, reply_to=None, created_at=None, attachments=None):
+                content, reply_to=None, created_at=None, attachments=None,
+                display_name=""):
     created_at = created_at if created_at is not None else time.time()
     # msg_id may be str (discord snowflake) — store as int when possible
     try:
@@ -131,10 +135,11 @@ def add_message(channel_id, msg_id, author_id, author_name, role,
     try:
         con.execute(
             """INSERT OR REPLACE INTO messages
-               (channel_id, msg_id, author_id, author_name, role, content, reply_to, created_at, attachments)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               (channel_id, msg_id, author_id, author_name, display_name, role, content, reply_to, created_at, attachments)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (str(channel_id), msg_id, str(author_id), str(author_name),
-             str(role), str(content), reply_to, created_at, attachments_json),
+             str(display_name or ""), str(role), str(content), reply_to,
+             created_at, attachments_json),
         )
         con.execute(
             "DELETE FROM messages_fts WHERE channel_id=? AND msg_id=?",
@@ -154,8 +159,8 @@ def get_recent(channel_id, limit=50):
     con = _connect()
     try:
         rows = con.execute(
-            """SELECT channel_id, msg_id, author_id, author_name, role,
-                      content, reply_to, created_at, attachments
+            """SELECT channel_id, msg_id, author_id, author_name, display_name,
+                      role, content, reply_to, created_at, attachments
                FROM messages WHERE channel_id=? ORDER BY msg_id DESC LIMIT ?""",
             (str(channel_id), int(limit)),
         ).fetchall()
@@ -203,7 +208,7 @@ def get_messages_by_ids(channel_id, ids):
     con = _connect()
     try:
         rows = con.execute(
-            f"""SELECT msg_id, author_id, author_name, role,
+            f"""SELECT msg_id, author_id, author_name, display_name, role,
                        content, reply_to, created_at, attachments
                 FROM messages WHERE channel_id=? AND msg_id IN ({q})""",
             (str(channel_id), *want),
@@ -234,7 +239,7 @@ def get_messages_before(channel_id, msg_id, limit=3):
     con = _connect()
     try:
         rows = con.execute(
-            """SELECT msg_id, author_id, author_name, role,
+            """SELECT msg_id, author_id, author_name, display_name, role,
                       content, reply_to, created_at, attachments
                FROM messages WHERE channel_id=? AND msg_id < ?
                ORDER BY msg_id DESC LIMIT ?""",

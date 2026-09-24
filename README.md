@@ -214,7 +214,10 @@ debug log):
 2. `Examples:` — top-ranked style examples (default 10, token-budgeted)
 3. Long-term memory blocks (summaries, recalled messages, user facts)
 4. Web results (if a search trigger fired)
-5. Recent conversation window (token-budgeted)
+5. Recent conversation window (token-budgeted) — lines render as
+   `account [display]: message`, with the bracket skipped when the
+   server nickname equals the account name (same format in the
+   replied-to context block)
 
 ---
 
