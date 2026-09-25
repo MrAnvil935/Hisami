@@ -99,6 +99,11 @@ def apply_config(cfg, initial=False):
     global MEMORY_SUMMARY_MIN_MSGS, MODEL, OLLAMA_AUTOLOAD, OLLAMA_BASE
     global OLLAMA_MODEL, OLLAMA_TIMEOUT, OLLAMA_URL, OPENROUTER_API_KEY
     global OPENROUTER_HEADERS, PROMPT_COMMAND_DESCRIPTION, PROMPT_COMMAND_NAME
+    global PROMPT_FETCH_CHARS, PROMPT_FETCH_COUNT, PROMPT_FETCH_ENABLED
+    global PROMPT_FETCH_MAX_BYTES, PROMPT_FETCH_TIMEOUT
+    global PROMPT_ROUTER_ENABLED, PROMPT_ROUTER_MAX_QUERIES
+    global PROMPT_ROUTER_MAX_TOKENS, PROMPT_ROUTER_MODEL
+    global PROMPT_ROUTER_OLLAMA_MODEL, PROMPT_ROUTER_TIMEOUT
     global PROMPT_SYSTEM, RANDOMIMAGE_COMMAND_DESCRIPTION
     global RANDOMIMAGE_COMMAND_NAME, RANDOMIMAGE_COMMAND_TEXT
     global REPLY_CONTEXT_BEFORE, REPLY_CONTEXT_PARENT_CHARS
@@ -222,6 +227,24 @@ def apply_config(cfg, initial=False):
     STATUS_COMMAND_DESCRIPTION = cfg["status_command_description"]
     PROMPT_COMMAND_NAME = cfg["prompt_command_name"]
     PROMPT_COMMAND_DESCRIPTION = cfg["prompt_command_description"]
+    # Agentic /prompt web flow: a small model decides IF search is needed
+    # and WHAT queries to issue (local Ollama first, OpenRouter fallback).
+    # Disabled -> verbatim-query DDG like before.
+    PROMPT_ROUTER_ENABLED = cfg.get("prompt_router_enabled", True)
+    PROMPT_ROUTER_OLLAMA_MODEL = cfg.get(
+        "prompt_router_ollama_model", "gemma3n:e4b")
+    PROMPT_ROUTER_MODEL = cfg.get("prompt_router_model", "openrouter/free")
+    PROMPT_ROUTER_MAX_QUERIES = cfg.get("prompt_router_max_queries", 2)
+    PROMPT_ROUTER_MAX_TOKENS = cfg.get("prompt_router_max_tokens", 300)
+    PROMPT_ROUTER_TIMEOUT = cfg.get("prompt_router_timeout", 30)
+    # Fetch stage: top result pages are downloaded and their article text
+    # injected into the model prompt (per-URL fail-soft to snippets).
+    PROMPT_FETCH_ENABLED = cfg.get("prompt_fetch_enabled", True)
+    PROMPT_FETCH_COUNT = cfg.get("prompt_fetch_count", 2)
+    PROMPT_FETCH_TIMEOUT = cfg.get("prompt_fetch_timeout", 8)
+    PROMPT_FETCH_CHARS = cfg.get("prompt_fetch_chars", 2000)
+    PROMPT_FETCH_MAX_BYTES = cfg.get(
+        "prompt_fetch_max_bytes", 1024 * 1024)
     WEB_COMMAND_NAME = cfg.get("web_command_name", "web")
     WEB_COMMAND_DESCRIPTION = cfg.get(
         "web_command_description", "Search the web, no AI involved")
@@ -591,6 +614,15 @@ DDG_HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Referer": "https://duckduckgo.com/",
+}
+
+# Page fetch for the /prompt flow: plain browser UA, no referer.
+FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
 }
 
 
@@ -1697,10 +1729,157 @@ def create_full_output_file(text):
     )
 
 
-def build_web_prompt(query, results):
+def fetch_page(url, timeout=None, max_bytes=None):
+    """Blocking: download a page, return HTML text or None. Fail-soft.
+
+    Non-HTML content and over-cap bodies are skipped (snippet survives).
+    """
+    if timeout is None:
+        timeout = PROMPT_FETCH_TIMEOUT
+    if max_bytes is None:
+        max_bytes = PROMPT_FETCH_MAX_BYTES
+    try:
+        r = http.get(url, timeout=timeout, headers=FETCH_HEADERS)
+        if r.status_code != 200 or not r.content:
+            return None
+        ctype = r.headers.get("Content-Type", "")
+        if "html" not in ctype and "text" not in ctype:
+            return None
+        if len(r.content) > max_bytes:
+            log.info("[prompt-fetch] %s over size cap, skipping", url)
+            return None
+        return r.content.decode(r.encoding or "utf-8", errors="replace")
+    except Exception as e:
+        log.debug("[prompt-fetch] %s failed: %s", url, e)
+        return None
+
+
+async def router_generate(query, history_text=""):
+    """Decide IF /prompt needs web search and WHAT queries to run.
+
+    Small-model local-first chain (router Ollama model, then router
+    OpenRouter model). Returns (need_search, queries); any failure
+    returns (True, [query]) so callers keep the verbatim-search
+    behavior instead of breaking.
+    """
+    if not PROMPT_ROUTER_ENABLED:
+        return True, [query]
+    user_block = query
+    if str(history_text or "").strip():
+        user_block = (f"Conversation so far:\n{history_text}\n\n"
+                      f"Question: {query}")
+    messages = [
+        {"role": "system", "content": mem_web.ROUTER_SYSTEM},
+        {"role": "user", "content": user_block},
+    ]
+    try:
+        if await asyncio.to_thread(is_ollama_model_loaded,
+                                   PROMPT_ROUTER_OLLAMA_MODEL):
+            log.info("[router] Using local Ollama model (%s)",
+                     PROMPT_ROUTER_OLLAMA_MODEL)
+            raw = await ollama_chat(
+                messages,
+                model=PROMPT_ROUTER_OLLAMA_MODEL,
+                temperature=0.0,
+                num_ctx=2048,
+                timeout=PROMPT_ROUTER_TIMEOUT,
+                purpose="router",
+                num_predict=PROMPT_ROUTER_MAX_TOKENS,
+            )
+            if raw:
+                return mem_web.parse_router_decision(
+                    raw, max_queries=PROMPT_ROUTER_MAX_QUERIES,
+                    fallback_query=query)
+        log.info("[router] Using OpenRouter router model (%s)",
+                 PROMPT_ROUTER_MODEL)
+        raw = await openrouter_chat(
+            messages,
+            PROMPT_ROUTER_MODEL,
+            temperature=0.0,
+            max_tokens=PROMPT_ROUTER_MAX_TOKENS,
+            timeout=PROMPT_ROUTER_TIMEOUT,
+            max_retries=1,
+            purpose="router",
+        )
+        if raw:
+            return mem_web.parse_router_decision(
+                raw, max_queries=PROMPT_ROUTER_MAX_QUERIES,
+                fallback_query=query)
+    except Exception:
+        log.exception("[router] failed")
+    return True, [query]
+
+
+async def run_prompt_search(query, history_text=""):
+    """Agentic /prompt web flow: decide -> discover -> read.
+
+    Returns (prompt_text, record). prompt_text is the full user message
+    for generation (query + web sections, or bare query when the router
+    declines). record is JSON-safe for the results button:
+    {"searched", "queries", "results", "fetched": {url: chars}}.
+    Fail-soft at every stage; worst case mirrors today's output.
+    """
+    declined = {"searched": False, "queries": [],
+                "results": [], "fetched": {}}
+    need_search, queries = await router_generate(query, history_text)
+    if not need_search:
+        log.info("[prompt] router declined search")
+        return query, declined
+    queries = [q for q in (queries or []) if str(q or "").strip()]
+    if not queries:
+        queries = [query]
+    log.info("[prompt] router queries: %s", queries)
+    results, seen = [], set()
+    try:
+        qcap = max(1, int(PROMPT_ROUTER_MAX_QUERIES))
+    except (TypeError, ValueError):
+        qcap = 2
+    for q in queries[:qcap]:
+        try:
+            batch = await asyncio.to_thread(web_search, q)
+        except Exception:
+            log.exception("[prompt] search failed for %r", q)
+            batch = []
+        for r in batch or []:
+            url = r.get("url", "")
+            if url and url not in seen:
+                seen.add(url)
+                results.append(r)
+        if len(results) >= SEARCH_MAX_RESULTS:
+            break
+    results = results[:SEARCH_MAX_RESULTS]
+    contents = {}
+    if PROMPT_FETCH_ENABLED and results:
+        try:
+            fcap = max(1, int(PROMPT_FETCH_COUNT))
+        except (TypeError, ValueError):
+            fcap = 2
+        urls = [r["url"] for r in results[:fcap]
+                if r.get("url")]
+        if urls:
+            pages = await asyncio.gather(*[
+                asyncio.to_thread(fetch_page, u) for u in urls])
+            for url, html in zip(urls, pages):
+                if not html:
+                    continue
+                text = mem_web.extract_article_text(
+                    html, max_chars=PROMPT_FETCH_CHARS)
+                if str(text or "").strip():
+                    contents[url] = text
+            log.info("[prompt] fetched %d/%d pages",
+                     len(contents), len(urls))
+    prompt_text = build_web_prompt(query, results, contents or None)
+    record = {"searched": True, "queries": queries, "results": results,
+              "fetched": {u: len(t) for u, t in contents.items()}}
+    return prompt_text, record
+
+
+def build_web_prompt(query, results, contents=None):
     """
     Wrap a user query + search results into a /prompt message.
     Used both by the command and the Continue modal.
+    contents: optional {url: fetched article text}; results without
+    fetched text render as snippets like before.
     """
     if not results:
         return f"""
@@ -1713,12 +1892,27 @@ A web search was requested, but no useful search results were returned.
 Answer using your own knowledge, and do not invent facts.
 """
 
-    web_context = "\n\n".join(
-        f"[{i}] {r.get('title', 'No title')}\n"
-        f"URL: {r.get('url', '')}\n"
-        f"{r.get('snippet', '')}"
-        for i, r in enumerate(results, 1)
-    )
+    fetched_tier = mem_web.format_fetched_tier(results, contents)
+    snippet_lines = []
+    for i, r in enumerate(results, 1):
+        if contents and r.get("url", "") in contents:
+            snippet_lines.append(
+                f"[{i}] {r.get('title', 'No title')}\n"
+                f"URL: {r.get('url', '')}\n"
+                f"(full page text included above)")
+        else:
+            snippet_lines.append(
+                f"[{i}] {r.get('title', 'No title')}\n"
+                f"URL: {r.get('url', '')}\n"
+                f"{r.get('snippet', '')}")
+    web_context = "\n\n".join(snippet_lines)
+    if fetched_tier:
+        web_context = (
+            "FULL PAGE CONTENT (fetched for the top results):\n\n"
+            f"{fetched_tier}\n\n---\n\n"
+            "REMAINING RESULTS (snippets):\n\n"
+            f"{web_context}"
+        )
 
     return f"""
 The user asked:
@@ -1828,14 +2022,22 @@ class ContinuePromptModal(discord.ui.Modal):
             if self.web_enabled:
                 log.info("[prompt] Continue web search: %r", user_message)
 
-                web_results = await asyncio.to_thread(web_search, user_message)
-                prompt = build_web_prompt(user_message, web_results)
+                hist = [m for m in conversation["messages"][-6:]
+                        if m.get("role") != "system"]
+                history_text = "\n".join(
+                    f"{m.get('role', '?')}: "
+                    f"{str(m.get('content', ''))[:500]}" for m in hist)
+                prompt, web_record = await run_prompt_search(
+                    user_message, history_text)
+                web_results = web_record.get("results", [])
 
             conversation["messages"].append({
                 "role": "user",
                 "content": prompt,
             })
             conversation["web_results"] = web_results
+            if self.web_enabled:
+                conversation["web_search_record"] = web_record
 
             log.debug("PROMPT-CONTINUE SENT TO MODEL (%d msgs):\n%s\n[END PROMPT]",
                         len(conversation["messages"]),
@@ -1996,17 +2198,20 @@ class PromptView(discord.ui.LayoutView):
         if conversation is None:
             return
 
-        results = conversation.get("web_results", [])
+        record = conversation.get("web_search_record")
+        if record is not None:
+            # Agentic flow: queries issued + what the model was given.
+            web_text = mem_web.format_prompt_sources(record)
+        else:
+            results = conversation.get("web_results", [])
+            web_text = mem_web.format_web_results(results)
 
-        if not results:
+        if not web_text:
             await interaction.response.send_message(
                 "No web results were used.",
                 ephemeral=True,
             )
             return
-
-        # Build a separate V2 message containing the search results.
-        web_text = mem_web.format_web_results(results)
 
         container = discord.ui.Container()
         container.add_item(discord.ui.TextDisplay("## 🌐 Web search results"))
@@ -2499,12 +2704,13 @@ async def prompt_command(
 
         prompt = query
         web_results = []
+        web_search_record = None
 
         if web:
             log.info("[prompt] Web search: %r", query)
 
-            web_results = await asyncio.to_thread(web_search, query)
-            prompt = build_web_prompt(query, web_results)
+            prompt, web_search_record = await run_prompt_search(query)
+            web_results = web_search_record.get("results", [])
 
         # ====================================================
         # CREATE CONVERSATION
@@ -2551,6 +2757,7 @@ async def prompt_command(
 
             "last_response": reply,
             "web_results": web_results,
+            "web_search_record": web_search_record,
             "last_activity": time.time(),
             "generating": False,
         }

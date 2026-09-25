@@ -206,6 +206,34 @@
   // rate-limiting (HTTP 104 resets) — keep narrow if searches fail.
   "search_triggers": ["?", "latest", "news", "today", "what is", "price"],
 
+  // Agentic /prompt web flow: a small model decides IF search is needed
+  // and WHAT queries to issue. False restores verbatim-query DDG.
+  "prompt_router_enabled": true,
+  // Local router model, tried first when loaded (same default as the
+  // summarizer; tuned separately so chains stay independent).
+  "prompt_router_ollama_model": "gemma3n:e4b",
+  // OpenRouter fallback: evergreen free-model router (no slug to go
+  // stale). The task is trivial JSON; weak picks degrade to verbatim
+  // search via the parser fallback, never worse.
+  "prompt_router_model": "openrouter/free",
+  // Max search queries the router may issue per /prompt.
+  "prompt_router_max_queries": 2,
+  // Router output is one JSON object; 300 tokens is plenty.
+  "prompt_router_max_tokens": 300,
+  // Seconds per router call (fast small model; fail-soft to verbatim).
+  "prompt_router_timeout": 30,
+  // Fetch stage: top result pages are downloaded and their article text
+  // injected into the model prompt (per-URL fail-soft to snippets).
+  "prompt_fetch_enabled": true,
+  // Pages fetched per /prompt (each is a big prompt chunk; 2-3 is sane).
+  "prompt_fetch_count": 2,
+  // Seconds per page fetch (concurrent, so this bounds the whole stage).
+  "prompt_fetch_timeout": 8,
+  // Article-text chars kept per page.
+  "prompt_fetch_chars": 2000,
+  // Pages over this many bytes are skipped before parsing.
+  "prompt_fetch_max_bytes": 1048576,
+
   // Persona-defining system prompt for mention replies. This is what
   // makes the bot roleplay instead of answering as an assistant.
   "master_prompt": "You are discord bot roleplaying as a Discord user. Keep responses natural, short, and informal."
