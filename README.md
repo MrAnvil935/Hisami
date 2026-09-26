@@ -5,6 +5,10 @@ A Discord chatbot that mimics a specific user's chatting style using Retrieval-A
 The bot builds an embedding index from exported Discord messages and uses it as style examples during generation. It supports:
 
 * OpenRouter as the primary inference backend, Ollama as local-first option
+* Provider prompt caching disabled on every OpenRouter call
+  (`openrouter_no_cache`): stale warmed-up prefixes were making the bot
+  ignore fresh conversation. Tradeoff: no cache-read discounts, every
+  call bills full input price
 * Local embeddings using `nomic-embed-text`
 * HNSW vector search for fast example retrieval
 * Persistent per-channel conversation memory (SQLite)

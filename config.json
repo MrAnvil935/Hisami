@@ -8,6 +8,12 @@
   // OpenRouter API key, used for main chat fallback, summaries, and vision
   // fallback when the matching local Ollama model is not loaded.
   "openrouter_api_key": "Put openrouter key here",
+  // Disable provider prompt caching on every OpenRouter call (documented
+  // explicit-mode opt-out plus a per-request nonce busting automatic
+  // prefix caching). Stale caches can serve warmed-up prefixes that make
+  // the bot ignore fresh conversation. Tradeoff: no cache-read discounts,
+  // every call bills full input price. Flip off if a provider 400s.
+  "openrouter_no_cache": true,
 
   // Primary chat model (OpenRouter). Used when the local ollama_model
   // below is not loaded.

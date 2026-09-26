@@ -98,7 +98,8 @@ def apply_config(cfg, initial=False):
     global MEMORY_SUMMARY_CHUNK, MEMORY_SUMMARY_CHUNK_TOKENS
     global MEMORY_SUMMARY_MIN_MSGS, MODEL, OLLAMA_AUTOLOAD, OLLAMA_BASE
     global OLLAMA_MODEL, OLLAMA_TIMEOUT, OLLAMA_URL, OPENROUTER_API_KEY
-    global OPENROUTER_HEADERS, PROMPT_COMMAND_DESCRIPTION, PROMPT_COMMAND_NAME
+    global OPENROUTER_HEADERS, OPENROUTER_NO_CACHE
+    global PROMPT_COMMAND_DESCRIPTION, PROMPT_COMMAND_NAME
     global PROMPT_FETCH_CHARS, PROMPT_FETCH_COUNT, PROMPT_FETCH_ENABLED
     global PROMPT_FETCH_MAX_BYTES, PROMPT_FETCH_TIMEOUT
     global PROMPT_ROUTER_ENABLED, PROMPT_ROUTER_MAX_QUERIES
@@ -129,6 +130,11 @@ def apply_config(cfg, initial=False):
     OPENROUTER_API_KEY = cfg["openrouter_api_key"]
     MODEL = cfg.get("model", "openrouter/free")
     FALLBACK_MODEL = cfg["fallback_model"]
+    # Disable provider prompt caching on every OpenRouter call: documented
+    # explicit-mode opt-out (OpenAI 5.6+) plus a per-request nonce busting
+    # automatic prefix caching elsewhere. Costs cache-read discounts —
+    # every call bills full input price. Flip off if a provider 400s.
+    OPENROUTER_NO_CACHE = cfg.get("openrouter_no_cache", True)
 
     MASTER_PROMPT = cfg["master_prompt"]
     PROMPT_SYSTEM = cfg.get("prompt_system", "You are a helpful assistant.")
@@ -1226,6 +1232,25 @@ async def openrouter_chat(messages, model, tag_as_fallback=False,
     }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+
+    if OPENROUTER_NO_CACHE:
+        # Documented off-switch for OpenAI GPT-5.6+ (explicit mode with
+        # no breakpoints = no cacheable prefix). Other providers ignore
+        # the field. We never send cache_control breakpoints, so
+        # Anthropic/Alibaba-style explicit caching is off regardless.
+        payload["prompt_cache_options"] = {"mode": "explicit"}
+        # Automatic prefix caching (Z.AI, DeepSeek, ...) has no opt-out:
+        # bust it with a unique nonce at the very start so no two
+        # requests share a cacheable prefix. Rebuild the list — never
+        # mutate the caller's messages (prompt conversations persist
+        # across turns).
+        first = payload["messages"][0] if payload["messages"] else None
+        if (isinstance(first, dict) and first.get("role") == "system"
+                and isinstance(first.get("content"), str)):
+            head = dict(first)
+            head["content"] = (f"[nocache:{uuid.uuid4().hex[:8]}]\n"
+                               + head["content"])
+            payload["messages"] = [head] + list(payload["messages"][1:])
 
     retries = MAX_RETRIES if max_retries is None else max_retries
     req_timeout = REQUEST_TIMEOUT if timeout is None else timeout
