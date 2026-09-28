@@ -301,6 +301,54 @@ class BufferTest(TempDBMixin, unittest.TestCase):
              "content": "yo"})
         self.assertEqual(out, "alice [Ali] (replying to bob [Bobby]: yo): hi")
 
+    def test_format_assistant_line_no_author(self):
+        self.assertEqual(
+            mem_buffer.format_assistant_line(
+                {"author": "Assistant", "content": "xd"}),
+            "xd")
+        with_marker = mem_buffer.format_assistant_line(
+            {"author": "Assistant", "content": "look",
+             "attachments": [{"kind": "image", "name": "p.png"}]})
+        self.assertEqual(with_marker, "look [image: p.png]")
+
+    def test_format_turns_roles_and_current_dedup(self):
+        history = [
+            {"id": 1, "author": "alice", "display_name": "Ali",
+             "role": "user", "content": "hi"},
+            {"id": 2, "author": "Assistant", "role": "assistant",
+             "content": "yo"},
+            {"id": 3, "author": "bob", "role": "user", "content": "ping"},
+        ]
+        turns = mem_buffer.format_turns(
+            history, current_message_id=3,
+            username="bob", user_message="ping")
+        roles = [t["role"] for t in turns]
+        self.assertEqual(roles, ["user", "assistant", "user"])
+        self.assertEqual(turns[0]["content"], "alice [Ali]: hi")
+        self.assertEqual(turns[1]["content"], "yo")
+        # current message appears once, as the final cleaned turn
+        self.assertEqual(turns[-1]["content"], "bob: ping")
+        self.assertEqual(sum("ping" in t["content"] for t in turns), 1)
+
+    def test_format_turns_reply_parent_and_final_display(self):
+        history = [
+            {"id": 1, "author": "alice", "role": "user", "content": "x"},
+            {"id": 2, "author": "bob", "role": "user", "content": "yes",
+             "reply_to": 1},
+        ]
+        parent_map = {1: history[0]}
+        turns = mem_buffer.format_turns(
+            history, parent_map, current_message_id=2,
+            username="carol", user_message="hey", display_name="Caro")
+        self.assertEqual(turns[0]["content"], "alice: x")
+        self.assertEqual(turns[-1]["content"], "carol [Caro]: hey")
+
+    def test_format_turns_empty_window(self):
+        turns = mem_buffer.format_turns(
+            [], {}, current_message_id=None,
+            username="alice", user_message="hi")
+        self.assertEqual(turns, [{"role": "user", "content": "alice: hi"}])
+
 
 class RecallTest(TempDBMixin, unittest.TestCase):
     def test_fts_recall(self):
@@ -625,6 +673,19 @@ class ExamplesTest(unittest.TestCase):
         # tiny budget still keeps the top example
         tiny = mem_examples.fit_examples(examples, 1)
         self.assertEqual(len(tiny), 1)
+
+    def test_fit_examples_preserves_full_context(self):
+        # A long Context must survive intact (token budget is the only cap).
+        context = "\n".join(f"alice: detail line {i}" for i in range(40))
+        raw = ("STYLE EXAMPLE (tone)\n\nContext:\n" + context
+               + "\n\nUser Input:\nwhy?\n\nTarget Response:\nok")
+        fitted = mem_examples.fit_examples([raw], 5000)
+        self.assertEqual(len(fitted), 1)
+        for i in range(40):
+            self.assertIn(f"detail line {i}", fitted[0])
+        self.assertIn("why?", fitted[0])
+        self.assertIn("Target Response:", fitted[0])
+        self.assertNotIn("STYLE EXAMPLE", fitted[0])
 
 
 class LlmLogTest(unittest.TestCase):

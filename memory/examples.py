@@ -29,8 +29,10 @@ def strip_example_boilerplate(ex):
 def fit_examples(examples, budget_tokens):
     """Keep best-ranked examples that fit into the token budget.
 
-    Always keeps at least the top example even if it alone exceeds
-    the budget.
+    Examples keep their full Context / User Input / Target Response body
+    (only the generated boilerplate is stripped), so the token budget is
+    the only size limit. Always keeps at least the top example even if
+    it alone exceeds the budget.
     """
     fitted = []
     used = 0

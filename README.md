@@ -215,18 +215,31 @@ old one with an error message.
 
 ## Prompt assembly
 
-Per reply, from fattest to leanest section (see `[prompt] sections` in the
-debug log):
+Per reply the request is a single `system` message followed by real
+`user`/`assistant` conversation turns (so the model follows the live
+exchange; retrieved context never sits between the turns). See
+`[prompt] token estimates` in the debug log.
 
-1. `Style summary:` — static profile from `style_profile.txt` (or generic
+The `system` message holds, in order:
+
+1. Persona (`master_prompt`) — sent exactly once
+2. `Style summary:` — static profile from `style_profile.txt` (or generic
    fallback lines if missing)
-2. `Examples:` — top-ranked style examples (default 10, token-budgeted)
-3. Long-term memory blocks (summaries, recalled messages, user facts)
-4. Web results (if a search trigger fired)
-5. Recent conversation window (token-budgeted) — lines render as
-   `account [display]: message`, with the bracket skipped when the
-   server nickname equals the account name (same format in the
-   replied-to context block)
+3. `Examples:` — top-ranked style examples (token-budgeted by
+   `examples_max_tokens`, the only size limit), keeping each example's
+   full Context / User Input / Target Response body and explicitly
+   framed as tone references that must never be answered
+4. `Reference memory:` summaries, recalled messages or the reply-context
+   block, and author/peer facts
+5. Web results (if a search trigger fired) and the image description
+6. A closing line telling the model the above is background context
+
+Then the conversation turns: user turns render as
+`account [display]: message` (bracket skipped when the nickname equals
+the account name; same format in the replied-to context block), bot
+turns as plain `assistant` content. The current message is appended as
+the final user turn exactly once — it is filtered out of the history
+window because it is stored before assembly.
 
 ---
 
@@ -236,7 +249,7 @@ Terminal output stays at INFO (one line per model call). Full detail goes to
 `logs/` (gitignored):
 
 * `logs/bot.log` — rotating file log at DEBUG, including full prompts
-  (`PROMPT SENT TO MODEL … [END PROMPT]`) and per-section sizes.
+  (`PROMPT SENT TO MODEL … [END PROMPT]`) and per-section token estimates.
 * `logs/llm.jsonl` — one pretty-printed JSON object per LLM call with full
   request/response bodies, purpose tag (`chat`, `prompt`, `summary`,
   `facts`, `vision`), latency and status. Never contains HTTP headers

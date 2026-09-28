@@ -925,8 +925,55 @@ async def get_memory_context(channel_id, user_message, author_id="",
     return "".join(blocks)
 
 
-async def build_prompt(channel_id, user_message, username, author_id="",
-                       image_block="", reply_block=""):
+def build_system_content(style_block, examples_block, memory_block,
+                         web_block, image_block):
+    """Assemble the single system message: persona + reference material.
+
+    Everything the model should treat as background (style, examples,
+    long-term memory, web, image) lives here so the live conversation
+    turns stay clean. Pure function (no I/O).
+    """
+    parts = [MASTER_PROMPT]
+    if style_block:
+        parts.append(style_block)
+    else:
+        # Fallback until style_profile.txt is generated (see style_profile.py).
+        parts.append(
+            "STYLE PROFILE:\n"
+            "- Casual Discord language\n"
+            "- Short responses\n"
+            "- Slang-heavy\n"
+        )
+    if examples_block:
+        parts.append(
+            "Examples (tone references from other conversations — never "
+            "reply to them, only imitate their style):\n" + examples_block
+        )
+    if memory_block:
+        parts.append(
+            "Reference memory (background from past conversations):"
+            + memory_block)
+    if web_block:
+        parts.append(web_block)
+    if image_block:
+        parts.append(image_block)
+    parts.append(
+        "The reference material above is background context only. Reply "
+        "in character to the final user message in the conversation."
+    )
+    return "\n".join(parts).strip() + "\n"
+
+
+async def build_messages(channel_id, user_message, username, author_id="",
+                         image_block="", reply_block="",
+                         current_message_id=None, display_name=""):
+    """Build the full chat messages list for one reply.
+
+    Returns [system] + role-tagged conversation turns (see
+    mem_buffer.format_turns). Retrieved context goes into the single
+    system message; the live exchange stays as real user/assistant
+    turns so the model can follow the conversation properly.
+    """
     # Retrieval, web search and long-term memory are independent.
     examples, web_block, memory_block = await asyncio.gather(
         asyncio.to_thread(retrieve_examples, channel_id, user_message),
@@ -935,44 +982,24 @@ async def build_prompt(channel_id, user_message, username, author_id="",
                            reply_block),
     )
 
-    prompt = f"\n{MASTER_PROMPT}\n\n"
-
     style_block = ""
     if STYLE_PROFILE_TEXT:
-        # Corpus-derived profile replaces the generic hardcoded lines below.
+        # Corpus-derived profile replaces the generic hardcoded lines.
         style_block = (
-            "\nStyle summary:\n"
+            "Style summary:\n"
             + STYLE_PROFILE_TEXT[:STYLE_PROFILE_MAX_CHARS] + "\n"
-        )
-        prompt += style_block
-    else:
-        # Fallback until style_profile.txt is generated (see style_profile.py).
-        prompt += (
-            "STYLE PROFILE:\n"
-            "- Casual Discord language\n"
-            "- Short responses\n"
-            "- Slang-heavy\n\n"
         )
 
     if examples:
         fitted = await asyncio.to_thread(
             mem_examples.fit_examples, examples, EXAMPLES_MAX_TOKENS)
-        examples_block = "\nExamples:\n" + "".join(f"- {ex}\n" for ex in fitted)
-        prompt += examples_block
+        examples_block = "".join(f"- {ex}\n" for ex in fitted)
     else:
         examples_block = ""
         fitted = []
 
-    if memory_block:
-        prompt += memory_block
-
-    if web_block:
-        prompt += web_block
-
-    if image_block:
-        prompt += image_block
-
-    prompt += "\nConversation:\n"
+    system_content = build_system_content(
+        style_block, examples_block, memory_block, web_block, image_block)
 
     history = _history_compat(channel_id)
 
@@ -1002,19 +1029,24 @@ async def build_prompt(channel_id, user_message, username, author_id="",
                 "attachments": row.get("attachments") or [],
             }
 
-    for m in history:
-        prompt += mem_buffer.format_history_line(
-            m, msg_map.get(m["reply_to"]) if m.get("reply_to") else None) + "\n"
+    turns = mem_buffer.format_turns(
+        history, msg_map, current_message_id,
+        username=username, user_message=user_message,
+        display_name=display_name)
 
-    prompt += f"\nPrompt:\n{username}: {user_message}\n{ASSISTANT_NAME}:"
+    messages = [{"role": "system", "content": system_content}] + turns
 
+    system_tokens = mem_buffer.estimate_tokens(system_content)
+    turn_tokens = sum(
+        mem_buffer.estimate_tokens(t["content"]) for t in turns)
     log.debug(
-        "[prompt] sections chars: style=%d examples=%d/%d memory=%d web=%d image=%d total=%d",
-        len(style_block), len(examples_block), len(fitted), len(memory_block),
-        len(web_block), len(image_block), len(prompt),
+        "[prompt] token estimates: system=%d turns=%d total=%d "
+        "(examples=%d, turns=%d)",
+        system_tokens, turn_tokens, system_tokens + turn_tokens,
+        len(fitted), len(turns),
     )
 
-    return prompt
+    return messages
 
 # ============================================================
 # GENERATION
@@ -2989,28 +3021,20 @@ async def on_message(message):
                     if reply_block:
                         log.info("[reply] out-of-window parent context injected")
 
-                prompt = await build_prompt(
+                messages = await build_messages(
                     message.channel.id,
                     cleaned,
                     str(message.author),
                     str(message.author.id),
                     image_block,
                     reply_block,
+                    current_message_id=message.id,
+                    display_name=str(
+                        getattr(message.author, "display_name", "") or ""),
                 )
 
-                log.debug("PROMPT SENT TO MODEL (%d chars):\n%s\n[END PROMPT]",
-                            len(prompt), prompt)
-
-                messages = [
-                    {
-                        "role": "system",
-                        "content": MASTER_PROMPT,
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    },
-                ]
+                log.debug("PROMPT SENT TO MODEL (%d msgs):\n%s\n[END PROMPT]",
+                            len(messages), messages)
 
                 # Drop any stale in-flight record (e.g. a generation that
                 # raised before sending) so the stash below always belongs

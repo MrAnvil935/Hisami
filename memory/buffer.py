@@ -87,3 +87,44 @@ def format_history_line(msg, parent=None):
     if markers:
         text += markers
     return text
+
+
+def format_assistant_line(msg):
+    """Render a bot message as an assistant turn (no author prefix).
+
+    The role already conveys the speaker, so only content + media
+    markers are emitted. Pure function (no I/O).
+    """
+    return (str(msg.get("content", ""))
+            + mem_vision.format_markers(msg.get("attachments")))
+
+
+def format_turns(history, parent_map=None, current_message_id=None,
+                 username="", user_message="", display_name=""):
+    """Build role-tagged chat turns from the window (oldest -> newest).
+
+    User turns keep 'author [display]: ...' labels (needed to tell
+    speakers apart in multi-user channels); assistant turns carry only
+    their content. The row whose id == current_message_id is dropped and
+    the caller's current message is appended as the final user turn, so
+    the live message is never duplicated (it is stored before prompt
+    assembly). Pure function (no I/O).
+    """
+    parent_map = parent_map or {}
+    turns = []
+    for m in history or []:
+        if (current_message_id is not None
+                and m.get("id") == current_message_id):
+            continue
+        if m.get("role") == "assistant":
+            turns.append({"role": "assistant",
+                          "content": format_assistant_line(m)})
+        else:
+            parent = (parent_map.get(m.get("reply_to"))
+                      if m.get("reply_to") else None)
+            turns.append({"role": "user",
+                          "content": format_history_line(m, parent)})
+    label = author_label(
+        {"author": username, "display_name": display_name})
+    turns.append({"role": "user", "content": f"{label}: {user_message}"})
+    return turns
