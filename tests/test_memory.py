@@ -341,10 +341,38 @@ class BufferTest(TempDBMixin, unittest.TestCase):
             history, parent_map, current_message_id=2,
             username="carol", user_message="hey", display_name="Caro")
         self.assertEqual(turns[0]["content"], "alice: x")
-        # final turn renders from the stored row (reply kept), with the
-        # cleaned content swapped in
+        # quoted parent preserved for the live reply turn
         self.assertEqual(
             turns[-1]["content"], "bob (replying to alice: x): hey")
+
+    def test_format_turns_in_window_parent_quoted(self):
+        history = [
+            {"id": 1, "author": "alice", "role": "user",
+             "content": "is this real?"},
+            {"id": 2, "author": "bob", "role": "user", "content": "yes",
+             "reply_to": 1},
+        ]
+        turns = mem_buffer.format_turns(
+            history, {1: history[0]}, current_message_id=99,
+            username="z", user_message="hey")
+        self.assertEqual(
+            turns[1]["content"],
+            "bob (replying to alice: is this real?): yes")
+
+    def test_format_turns_out_of_window_parent_quoted(self):
+        # parent fetched into parent_map but not itself a turn (id 50)
+        history = [
+            {"id": 2, "author": "bob", "role": "user", "content": "yes",
+             "reply_to": 50},
+        ]
+        parent = {"id": 50, "author": "carol",
+                  "content": "do you know dj hornyhorse?"}
+        turns = mem_buffer.format_turns(
+            history, {50: parent}, current_message_id=99,
+            username="z", user_message="hey")
+        self.assertIn(
+            "bob (replying to carol: do you know dj hornyhorse?): yes",
+            turns[0]["content"])
 
     def test_format_turns_final_falls_back_when_row_absent(self):
         turns = mem_buffer.format_turns(
@@ -410,6 +438,59 @@ class BufferTest(TempDBMixin, unittest.TestCase):
             [], {}, current_message_id=None,
             username="alice", user_message="hi")
         self.assertEqual(turns, [{"role": "user", "content": "alice: hi"}])
+
+    def test_strip_reply_marker_pointer(self):
+        self.assertEqual(
+            mem_buffer.strip_reply_markers(
+                "(in reply to alice [Ali]): hey there"),
+            "hey there")
+
+    def test_strip_reply_marker_quoted(self):
+        self.assertEqual(
+            mem_buffer.strip_reply_markers(
+                "(replying to bob: do you know dj hornyhorse?): "
+                "no and i feel like i dont want to xd"),
+            "no and i feel like i dont want to xd")
+
+    def test_strip_reply_marker_balanced_parens(self):
+        # a stray ')' inside quoted text (not followed by ':') must not
+        # cut before the marker terminator
+        self.assertEqual(
+            mem_buffer.strip_reply_markers(
+                "(replying to alice: hi ) there): ok"),
+            "ok")
+
+    def test_strip_reply_marker_stale(self):
+        self.assertEqual(
+            mem_buffer.strip_reply_markers(
+                "(replying to an older message outside current context): yo"),
+            "yo")
+
+    def test_strip_reply_marker_case_insensitive(self):
+        self.assertEqual(
+            mem_buffer.strip_reply_markers("(Replying to Bob): hi"),
+            "hi")
+
+    def test_strip_reply_marker_stacked_and_whitespace(self):
+        self.assertEqual(
+            mem_buffer.strip_reply_markers(
+                "\n  (in reply to a): (in reply to b): real text"),
+            "real text")
+
+    def test_strip_reply_marker_no_marker_untouched(self):
+        self.assertEqual(
+            mem_buffer.strip_reply_markers("(really) cool"), "(really) cool")
+        self.assertEqual(
+            mem_buffer.strip_reply_markers("yes (in reply to bob)"),
+            "yes (in reply to bob)")
+        self.assertEqual(mem_buffer.strip_reply_markers(""), "")
+        self.assertEqual(mem_buffer.strip_reply_markers(None), "None")
+
+    def test_strip_reply_marker_only_marker_kept(self):
+        # nothing left after stripping -> keep original, never return empty
+        original = "(in reply to alice): "
+        self.assertEqual(
+            mem_buffer.strip_reply_markers(original), original)
 
 
 class RecallTest(TempDBMixin, unittest.TestCase):

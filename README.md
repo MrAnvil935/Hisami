@@ -237,9 +237,15 @@ The `system` message holds, in order:
 Then the conversation turns: user turns render as
 `account [display]: message` (bracket skipped when the nickname equals
 the account name; same format in the replied-to context block), bot
-turns as plain `assistant` content. The current message is appended as
-the final user turn exactly once — it is filtered out of the history
-window because it is stored before assembly.
+turns as plain `assistant` content. Replies render the quoted form
+`(replying to <author>: <truncated parent>)` for both roles; unresolved
+parents show the stale marker. Because a style-mimicking model
+sometimes copies that marker into its own output, a leading reply
+marker is stripped from generated replies before sending/storing
+(`strip_reply_markers`) — the context stays in the prompt, the artifact
+never reaches users. The current message is appended as the final user
+turn exactly once — it is filtered out of the history window because it
+is stored before assembly.
 
 ---
 

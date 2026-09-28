@@ -959,7 +959,10 @@ def build_system_content(style_block, examples_block, memory_block,
         parts.append(image_block)
     parts.append(
         "The reference material above is background context only. Reply "
-        "in character to the final user message in the conversation."
+        "in character to the final user message in the conversation. "
+        "Reply with natural chat text only: never output metadata, "
+        "labels, bracketed annotations, or formatting taken from the "
+        "context above."
     )
     return "\n".join(parts).strip() + "\n"
 
@@ -3046,6 +3049,11 @@ async def on_message(message):
                 # FINAL SAFETY NET
                 if reply is None:
                     reply = "All models are currently unavailable 💀"
+
+                # The model sometimes mimics the reply markers we inject
+                # into assistant turns; strip a leading one so it never
+                # reaches the user or long-term memory.
+                reply = mem_buffer.strip_reply_markers(reply)
 
                 # Long replies split into ≤ REPLY_MAX_PARTS Discord-sized
                 # chunks (fence-aware); the first goes as the reply so

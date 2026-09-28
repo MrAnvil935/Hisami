@@ -6,6 +6,41 @@ from . import vision as mem_vision
 PARENT_TRUNCATE_CHARS = 300
 STALE_REPLY_MARKER = "replying to an older message outside current context"
 
+# Leading reply markers injected at render time. The model sometimes
+# mimics them; strip_reply_markers removes them from generated output.
+REPLY_MARKER_PREFIXES = ("(in reply to ", "(replying to ")
+
+
+def strip_reply_markers(text):
+    """Remove a leading reply-marker the model mimicked, if present.
+
+    Looks for the marker terminator '):' (or a bare ')' when the model
+    dropped the colon). This is more robust than a balanced-paren scan,
+    which a stray ')' inside quoted parent text would cut short. Loops
+    to clear stacked markers. Returns the input unchanged when there is
+    no leading marker, and never returns an empty string (falls back to
+    the original). Pure function (no I/O).
+    """
+    original = text if isinstance(text, str) else str(text)
+    current = original
+    while True:
+        lead = current.lstrip()
+        head = lead.lower()
+        if not any(head.startswith(p) for p in REPLY_MARKER_PREFIXES):
+            break
+        close = lead.find("):")
+        if close != -1:
+            rest = lead[close + 2:]
+        elif ")" in lead:
+            rest = lead[lead.find(")") + 1:]
+        else:
+            break
+        rest = rest.lstrip()
+        if not rest:
+            break
+        current = rest
+    return current or original
+
 
 def estimate_tokens(text: str) -> int:
     # ~4 chars per token heuristic; avoids new deps like tiktoken.
@@ -56,14 +91,13 @@ def author_label(msg):
 
 
 def format_history_line(msg, parent=None):
-    """Render one window message for the prompt (legacy compat shape).
+    """Render one window message for the prompt.
 
     - plain message: 'author [display]: content [markers]'
-    - reply with resolvable parent: 'author [display] (replying to X [Y]: ...)'
-    - reply with missing parent: 'author [display] (replying to an older
-      message outside current context): content [markers]' — honest about
-      the gap instead of silently flattening the reply into a standalone
-      statement.
+    - reply with resolvable parent: 'author [display] (replying to
+      X [Y]: <truncated parent>): content [markers]'
+    - reply with unresolvable parent: 'author [display] (replying to an
+      older message outside current context): content [markers]'.
 
     Parent content is truncated (auxiliary context, not primary).
     Media markers are always preserved. Pure function (no I/O).
@@ -93,10 +127,10 @@ def format_assistant_line(msg, parent=None):
     """Render a bot message as an assistant turn (no author prefix).
 
     The role already conveys the speaker, so only content + media
-    markers are emitted — but a reply context is preserved: when the
-    row carries reply_to and the parent resolves, it renders
-    '(replying to X: ...)' just like user turns, so reply threads
-    don't flatten into standalone statements. Pure function (no I/O).
+    markers are emitted — but a reply context is preserved (quoted, like
+    user turns) so reply threads don't flatten into standalone
+    statements. Lead marker mimicry in generated output is handled
+    separately by strip_reply_markers. Pure function (no I/O).
     """
     markers = mem_vision.format_markers(msg.get("attachments"))
     text = str(msg.get("content", ""))
@@ -123,12 +157,15 @@ def format_turns(history, parent_map=None, current_message_id=None,
     from its stored row (reply_to/attachments preserved) with only the
     content swapped for the caller's cleaned text, then appended as the
     final user turn — so the live message (including reply-pings) is
-    never duplicated and never stripped of context. Pure function
-    (no I/O).
+    never duplicated and never stripped of context.
+
+    Reply parents render with the quoted form for both roles. Pure
+    function (no I/O).
     """
     parent_map = parent_map or {}
+    history = history or []
     turns = []
-    for m in history or []:
+    for m in history:
         if (current_message_id is not None
                 and m.get("id") == current_message_id):
             continue
@@ -141,7 +178,7 @@ def format_turns(history, parent_map=None, current_message_id=None,
             turns.append({"role": "user",
                           "content": format_history_line(m, parent)})
     current = next(
-        (m for m in history or []
+        (m for m in history
          if current_message_id is not None
          and m.get("id") == current_message_id),
         None,
