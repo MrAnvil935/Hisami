@@ -341,7 +341,69 @@ class BufferTest(TempDBMixin, unittest.TestCase):
             history, parent_map, current_message_id=2,
             username="carol", user_message="hey", display_name="Caro")
         self.assertEqual(turns[0]["content"], "alice: x")
+        # final turn renders from the stored row (reply kept), with the
+        # cleaned content swapped in
+        self.assertEqual(
+            turns[-1]["content"], "bob (replying to alice: x): hey")
+
+    def test_format_turns_final_falls_back_when_row_absent(self):
+        turns = mem_buffer.format_turns(
+            [{"id": 1, "author": "alice", "role": "user",
+              "content": "x"}],
+            {}, current_message_id=999,
+            username="carol", user_message="hey", display_name="Caro")
         self.assertEqual(turns[-1]["content"], "carol [Caro]: hey")
+
+    def test_format_turns_final_missing_parent(self):
+        history = [
+            {"id": 2, "author": "bob", "role": "user", "content": "yes",
+             "reply_to": 1},
+        ]
+        turns = mem_buffer.format_turns(
+            history, {}, current_message_id=2,
+            username="bob", user_message="yes")
+        self.assertIn("outside current context", turns[-1]["content"])
+        self.assertTrue(turns[-1]["content"].startswith(
+            "bob (replying"))
+
+    def test_format_turns_final_keeps_attachments(self):
+        history = [
+            {"id": 2, "author": "bob", "role": "user", "content": "look",
+             "attachments": [{"kind": "image", "name": "p.png"}]},
+        ]
+        turns = mem_buffer.format_turns(
+            history, {}, current_message_id=2,
+            username="bob", user_message="look")
+        self.assertIn("[image: p.png]", turns[-1]["content"])
+
+    def test_format_assistant_line_with_reply(self):
+        parent = {"author": "alice", "display_name": "Ali",
+                  "content": "is this real?"}
+        out = mem_buffer.format_assistant_line(
+            {"author": "Assistant", "role": "assistant",
+             "content": "yes", "reply_to": 1}, parent)
+        self.assertEqual(
+            out, "(replying to alice [Ali]: is this real?): yes")
+
+    def test_format_assistant_line_missing_parent(self):
+        out = mem_buffer.format_assistant_line(
+            {"author": "Assistant", "role": "assistant",
+             "content": "yes", "reply_to": 999}, None)
+        self.assertTrue(out.startswith("(replying to an older message"))
+        self.assertTrue(out.endswith("yes"))
+
+    def test_format_turns_assistant_reply_resolved(self):
+        history = [
+            {"id": 1, "author": "alice", "role": "user", "content": "hi"},
+            {"id": 2, "author": "Assistant", "role": "assistant",
+             "content": "yo", "reply_to": 1},
+        ]
+        turns = mem_buffer.format_turns(
+            history, {1: history[0]}, current_message_id=99,
+            username="zed", user_message="hey")
+        self.assertEqual(
+            turns[1], {"role": "assistant",
+                       "content": "(replying to alice: hi): yo"})
 
     def test_format_turns_empty_window(self):
         turns = mem_buffer.format_turns(

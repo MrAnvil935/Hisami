@@ -89,14 +89,28 @@ def format_history_line(msg, parent=None):
     return text
 
 
-def format_assistant_line(msg):
+def format_assistant_line(msg, parent=None):
     """Render a bot message as an assistant turn (no author prefix).
 
     The role already conveys the speaker, so only content + media
-    markers are emitted. Pure function (no I/O).
+    markers are emitted — but a reply context is preserved: when the
+    row carries reply_to and the parent resolves, it renders
+    '(replying to X: ...)' just like user turns, so reply threads
+    don't flatten into standalone statements. Pure function (no I/O).
     """
-    return (str(msg.get("content", ""))
-            + mem_vision.format_markers(msg.get("attachments")))
+    markers = mem_vision.format_markers(msg.get("attachments"))
+    text = str(msg.get("content", ""))
+    if msg.get("reply_to"):
+        if parent is not None:
+            ptext = str(parent.get("content", ""))[:PARENT_TRUNCATE_CHARS]
+            text = (
+                f"(replying to {author_label(parent)}: {ptext}): {text}"
+            )
+        else:
+            text = f"({STALE_REPLY_MARKER}): {text}"
+    if markers:
+        text += markers
+    return text
 
 
 def format_turns(history, parent_map=None, current_message_id=None,
@@ -105,10 +119,12 @@ def format_turns(history, parent_map=None, current_message_id=None,
 
     User turns keep 'author [display]: ...' labels (needed to tell
     speakers apart in multi-user channels); assistant turns carry only
-    their content. The row whose id == current_message_id is dropped and
-    the caller's current message is appended as the final user turn, so
-    the live message is never duplicated (it is stored before prompt
-    assembly). Pure function (no I/O).
+    their content. The row whose id == current_message_id is rendered
+    from its stored row (reply_to/attachments preserved) with only the
+    content swapped for the caller's cleaned text, then appended as the
+    final user turn — so the live message (including reply-pings) is
+    never duplicated and never stripped of context. Pure function
+    (no I/O).
     """
     parent_map = parent_map or {}
     turns = []
@@ -116,15 +132,30 @@ def format_turns(history, parent_map=None, current_message_id=None,
         if (current_message_id is not None
                 and m.get("id") == current_message_id):
             continue
+        parent = (parent_map.get(m.get("reply_to"))
+                  if m.get("reply_to") else None)
         if m.get("role") == "assistant":
             turns.append({"role": "assistant",
-                          "content": format_assistant_line(m)})
+                          "content": format_assistant_line(m, parent)})
         else:
-            parent = (parent_map.get(m.get("reply_to"))
-                      if m.get("reply_to") else None)
             turns.append({"role": "user",
                           "content": format_history_line(m, parent)})
-    label = author_label(
-        {"author": username, "display_name": display_name})
-    turns.append({"role": "user", "content": f"{label}: {user_message}"})
+    current = next(
+        (m for m in history or []
+         if current_message_id is not None
+         and m.get("id") == current_message_id),
+        None,
+    )
+    if current is not None:
+        row = dict(current)
+        row["content"] = user_message
+        parent = (parent_map.get(row.get("reply_to"))
+                  if row.get("reply_to") else None)
+        turns.append({"role": "user",
+                      "content": format_history_line(row, parent)})
+    else:
+        label = author_label(
+            {"author": username, "display_name": display_name})
+        turns.append({"role": "user",
+                      "content": f"{label}: {user_message}"})
     return turns
