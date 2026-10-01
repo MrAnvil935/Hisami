@@ -13,7 +13,7 @@
   // prefix caching). Stale caches can serve warmed-up prefixes that make
   // the bot ignore fresh conversation. Tradeoff: no cache-read discounts,
   // every call bills full input price. Flip off if a provider 400s.
-  "openrouter_no_cache": true,
+  "openrouter_no_cache": false,
 
   // Primary chat model (OpenRouter). Used when the local ollama_model
   // below is not loaded.
