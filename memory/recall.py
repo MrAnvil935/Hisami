@@ -213,26 +213,28 @@ def _sort_key(msg_id):
         return (1, str(msg_id or ""))
 
 
-def render_recalled(kept, parents=None, bot_id="", bot_name="Assistant"):
+def render_recalled(kept, parents=None, bot_id="", bot_name="Assistant",
+                    names=None):
     """Render recall excerpts with explicit framing and reply linkage.
 
     Header states these are separate excerpts, not a continuous
     conversation. Any excerpt that is a reply carries its question
-    inline so the two can't be detached. Bot mentions resolve to
-    @bot_name. Empty input -> ''. Pure function (no I/O).
+    inline so the two can't be detached. Mentions resolve via `names`
+    (bot id -> @bot_name, unknown ids stay raw). Empty input -> ''.
+    Pure function (no I/O).
     """
     if not kept:
         return ""
     parents = parents or {}
     lines = []
     for r in kept:
-        content = mem_buffer.resolve_bot_mentions(
-            r.get("content", ""), bot_id, bot_name)
+        content = mem_buffer.resolve_mentions(
+            r.get("content", ""), names, bot_id, bot_name)
         label = mem_buffer.author_label(r)
         parent = parents.get(r.get("reply_to")) if r.get("reply_to") else None
         if parent is not None:
-            ptext = mem_buffer.resolve_bot_mentions(
-                str(parent.get("content") or ""), bot_id, bot_name
+            ptext = mem_buffer.resolve_mentions(
+                str(parent.get("content") or ""), names, bot_id, bot_name
             )[:mem_buffer.PARENT_TRUNCATE_CHARS]
             lines.append(
                 f"- {label} (replying to "
@@ -332,13 +334,13 @@ def channel_engaged(messages, bot_id, lookback=30):
 
 
 def format_reply_context(parent, previous, parent_chars=500, ctx_chars=300,
-                         bot_id="", bot_name="Assistant"):
+                         bot_id="", bot_name="Assistant", names=None):
     """Render a replied-to message + preceding context for the prompt.
 
     parent: dict with author_name/content (DB row or fetched message data).
     previous: list of similar dicts, oldest->newest. Returns '' when the
     parent is missing/empty (caller keeps keyword recall instead).
-    Bot mentions resolve to @bot_name. Pure function (no I/O) so it is
+    Mentions resolve via `names`. Pure function (no I/O) so it is
     unit-testable.
     """
     if not parent or not str(parent.get("content") or "").strip():
@@ -346,7 +348,7 @@ def format_reply_context(parent, previous, parent_chars=500, ctx_chars=300,
     lines = [
         "Replied-to message:",
         f"{mem_buffer.author_label(parent)}: "
-        f"{mem_buffer.resolve_bot_mentions(str(parent.get('content') or ''), bot_id, bot_name)[:parent_chars]}",
+        f"{mem_buffer.resolve_mentions(str(parent.get('content') or ''), names, bot_id, bot_name)[:parent_chars]}",
     ]
     ctx = [m for m in (previous or [])
            if str(m.get("content") or "").strip()]
@@ -354,7 +356,7 @@ def format_reply_context(parent, previous, parent_chars=500, ctx_chars=300,
         lines.append("Previous context:")
         lines.extend(
             f"{mem_buffer.author_label(m)}: "
-            f"{mem_buffer.resolve_bot_mentions(str(m.get('content') or ''), bot_id, bot_name)[:ctx_chars]}"
+            f"{mem_buffer.resolve_mentions(str(m.get('content') or ''), names, bot_id, bot_name)[:ctx_chars]}"
             for m in ctx
         )
     return "\n" + "\n".join(lines) + "\n"

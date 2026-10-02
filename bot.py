@@ -848,6 +848,32 @@ async def get_web_context(channel_id, user_message):
 # ============================================================
 
 
+async def build_mention_names(channel_id, texts, rows=None):
+    """Map mentioned <@id>s in `texts` to display names (channel-scoped).
+
+    Looks IDs up in the DB, then lets `rows` (fresher in-memory window
+    or fetched rows with author_id/display_name) override. Unknown ids
+    are simply absent so callers leave them raw. Fail-soft -> {}.
+    """
+    ids = set()
+    for t in texts or ():
+        ids.update(re.findall(r"<@!?(\d+)>", str(t or "")))
+    names = {}
+    if ids:
+        try:
+            names = await asyncio.to_thread(
+                mem_store.get_display_names, channel_id, ids)
+        except Exception:
+            log.exception("display name lookup failed")
+            names = {}
+    for row in rows or ():
+        uid = str(row.get("author_id") or "").strip()
+        disp = str(row.get("display_name") or "").strip()
+        if uid and disp:
+            names[uid] = disp
+    return names
+
+
 async def get_memory_context(channel_id, user_message, author_id="",
                              username="", reply_block="", exclude_ids=None,
                              bot_id="", bot_name=ASSISTANT_NAME):
@@ -918,8 +944,11 @@ async def get_memory_context(channel_id, user_message, author_id="",
                     parents = await asyncio.to_thread(
                         mem_store.get_messages_by_ids, channel_id,
                         parent_ids)
+                texts = [r.get("content", "") for r in enriched]
+                texts += [p.get("content", "") for p in parents.values()]
+                rec_names = await build_mention_names(channel_id, texts)
                 block = mem_recall.render_recalled(
-                    enriched, parents, bot_id, bot_name)
+                    enriched, parents, bot_id, bot_name, rec_names)
             except Exception:
                 log.exception("recall enrichment failed")
                 block = ""
@@ -1068,10 +1097,17 @@ async def build_messages(channel_id, user_message, username, author_id="",
                 "attachments": row.get("attachments") or [],
             }
 
+    name_texts = [m.get("content", "") for m in history]
+    name_texts += [r.get("content", "") for r in msg_map.values()]
+    name_texts.append(user_message)
+    names = await build_mention_names(
+        channel_id, name_texts, msg_map.values())
+
     turns = mem_buffer.format_turns(
         history, msg_map, current_message_id,
         username=username, user_message=user_message,
-        display_name=display_name, bot_id=bot_id, bot_name=bot_name)
+        display_name=display_name, bot_id=bot_id, bot_name=bot_name,
+        names=names)
 
     messages = [{"role": "system", "content": system_content}] + turns
 
@@ -1774,9 +1810,12 @@ async def build_reply_context_block(channel_id, message, target, window_ids,
 
     if parent is None:
         return ""
+    texts = [parent.get("content", "")]
+    texts += [m.get("content", "") for m in previous]
+    names = await build_mention_names(channel_id, texts)
     return mem_recall.format_reply_context(
         parent, previous, REPLY_CONTEXT_PARENT_CHARS, 300,
-        bot_id, bot_name)
+        bot_id, bot_name, names)
 
 
 async def describe_image(source_key, image_url, question=VISION_QUESTION):
@@ -2998,10 +3037,13 @@ async def on_message(message):
         return
     _last_call[message.author.id] = now
 
-    cleaned = re.sub(
+    # Guard on the ping-stripped text (a bare ping should nudge, not
+    # generate), but feed the raw text to assembly so the self-ping
+    # resolves to @Assistant instead of vanishing.
+    ping_stripped = re.sub(
         rf"<@!?{client.user.id}>", "", message.content).strip()
 
-    if not cleaned:
+    if not ping_stripped:
         await message.reply("Say something after pinging me.")
         return
 
@@ -3063,7 +3105,7 @@ async def on_message(message):
 
                 messages = await build_messages(
                     message.channel.id,
-                    cleaned,
+                    message.content,
                     str(message.author),
                     str(message.author.id),
                     image_block,

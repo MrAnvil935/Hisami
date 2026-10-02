@@ -204,10 +204,12 @@ prompt:
   ping replies to a message outside the recent window, this block is
   replaced by that message plus preceding context (DB first, Discord fetch
   fallback; fetched messages are stored so memory keeps continuity).
-* **Self-recognition** — the bot's own `<@id>`/`<@!id>` pings render as
-  `@Assistant` everywhere in the chat prompt (history, recall, reply
-  context), so it knows a ping refers to itself; the raw mention is also
-  stripped from the incoming message before assembly.
+* **Mention resolution** — raw `<@id>`/`<@!id>` mentions render as plain
+  `@DisplayName` everywhere in the chat prompt (history, recall, reply
+  context, and the incoming message), looked up channel-scoped from
+  stored display names; the bot's own id renders as `@Assistant` so it
+  knows a ping refers to itself. IDs with no known name stay raw, and
+  the plain-text form can't re-ping anyone.
 
 `/clearmemory` clears only the recent short-term buffer (to unstick a looping
 model); summaries and facts are preserved. `/status` reports buffer,

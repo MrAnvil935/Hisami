@@ -81,6 +81,17 @@ class StoreTest(TempDBMixin, unittest.TestCase):
         before = mem_store.get_messages_before("cd", 2, limit=1)
         self.assertEqual(before[0]["display_name"], "Ali")
 
+    def test_get_display_names(self):
+        mem_store.add_message("cg", 1, "u1", "alice", "user", "a",
+                              display_name="Ali")
+        mem_store.add_message("cg", 2, "u1", "alice", "user", "b",
+                              display_name="Alicia")
+        mem_store.add_message("cg", 3, "u2", "bob", "user", "c")
+        names = mem_store.get_display_names("cg", {"u1", "u2", "u9"})
+        # latest non-empty wins; empty filtered; unknown absent
+        self.assertEqual(names, {"u1": "Alicia"})
+        self.assertEqual(mem_store.get_display_names("cg", set()), {})
+
     def test_display_name_migration(self):
         import sqlite3
         con = sqlite3.connect(self.path)
@@ -509,6 +520,21 @@ class BufferTest(TempDBMixin, unittest.TestCase):
         # no bot id -> passthrough
         self.assertEqual(
             mem_buffer.resolve_bot_mentions("<@42>", ""), "<@42>")
+
+    def test_resolve_mentions(self):
+        names = {"55": "Bob"}
+        # bot id wins over names; known user -> @name; unknown raw
+        self.assertEqual(
+            mem_buffer.resolve_mentions(
+                "hi <@42> and <@!55> and <@99>", names, "42", "Assistant"),
+            "hi @Assistant and @Bob and <@99>")
+        self.assertEqual(
+            mem_buffer.resolve_mentions("plain", names, "42"), "plain")
+        self.assertEqual(mem_buffer.resolve_mentions("", names, "42"), "")
+        # no bot id still resolves known names
+        self.assertEqual(
+            mem_buffer.resolve_mentions("<@55> yo", names, ""),
+            "@Bob yo")
 
     def test_format_history_line_resolves_bot_ping(self):
         out = mem_buffer.format_history_line(

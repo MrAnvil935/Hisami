@@ -13,21 +13,38 @@ STALE_REPLY_MARKER = "replying to an older message outside current context"
 REPLY_MARKER_PREFIXES = ("(in reply to ", "(replying to ")
 
 
-def resolve_bot_mentions(text, bot_id, bot_name="Assistant"):
-    """Replace the bot's own <@id> / <@!id> mentions with @bot_name.
+_MENTION_RE = re.compile(r"<@!?(\d+)>")
 
-    Discord stores pings as raw IDs, so without this the model sees a
-    bare number and cannot tell the ping refers to itself. Foreign IDs
-    are left untouched. Pure function (no I/O).
+
+def resolve_mentions(text, names=None, bot_id="", bot_name="Assistant"):
+    """Rewrite <@id> / <@!id> to @DisplayName for known users.
+
+    The bot's own id becomes @bot_name. IDs absent from `names` are left
+    raw so missing data is never papered over. Output uses plain '@Name'
+    (no <@id> syntax), so it can't re-ping or trip mention detection.
+    Pure function (no I/O).
     """
     if not text:
         return text if isinstance(text, str) else ""
     text = str(text)
+    names = names or {}
     bot_id = str(bot_id or "").strip()
-    if not bot_id:
-        return text
-    name = str(bot_name or "Assistant")
-    return re.sub(rf"<@!?{re.escape(bot_id)}>", f"@{name}", text)
+
+    def _sub(m):
+        uid = m.group(1)
+        if bot_id and uid == bot_id:
+            return f"@{bot_name}"
+        name = names.get(uid)
+        if name:
+            return f"@{name}"
+        return m.group(0)
+
+    return _MENTION_RE.sub(_sub, text)
+
+
+def resolve_bot_mentions(text, bot_id, bot_name="Assistant"):
+    """Back-compat wrapper: resolve only the bot's own mentions."""
+    return resolve_mentions(text, None, bot_id, bot_name)
 
 
 def strip_reply_markers(text):
@@ -109,7 +126,8 @@ def author_label(msg):
     return name
 
 
-def format_history_line(msg, parent=None, bot_id="", bot_name="Assistant"):
+def format_history_line(msg, parent=None, bot_id="", bot_name="Assistant",
+                        names=None):
     """Render one window message for the prompt.
 
     - plain message: 'author [display]: content [markers]'
@@ -118,18 +136,19 @@ def format_history_line(msg, parent=None, bot_id="", bot_name="Assistant"):
     - reply with unresolvable parent: 'author [display] (replying to an
       older message outside current context): content [markers]'.
 
-    The bot's own pings render as @bot_name in content and parent
-    snippets so the model knows they refer to it. Parent content is
-    truncated (auxiliary context, not primary). Media markers are
-    always preserved. Pure function (no I/O).
+    Mentions in content and parent snippets resolve via `names`
+    (author_id -> display name); the bot's own id renders as @bot_name
+    and unknown ids stay raw. Parent content is truncated (auxiliary
+    context, not primary). Media markers are always preserved. Pure
+    function (no I/O).
     """
     markers = mem_vision.format_markers(msg.get("attachments"))
-    content = resolve_bot_mentions(msg.get("content", ""), bot_id, bot_name)
+    content = resolve_mentions(msg.get("content", ""), names, bot_id, bot_name)
     text = f"{author_label(msg)}: {content}"
     if msg.get("reply_to"):
         if parent is not None:
-            ptext = resolve_bot_mentions(
-                str(parent.get("content", "")), bot_id, bot_name
+            ptext = resolve_mentions(
+                str(parent.get("content", "")), names, bot_id, bot_name
             )[:PARENT_TRUNCATE_CHARS]
             text = (
                 f"{author_label(msg)} "
@@ -147,21 +166,23 @@ def format_history_line(msg, parent=None, bot_id="", bot_name="Assistant"):
     return text
 
 
-def format_assistant_line(msg, parent=None, bot_id="", bot_name="Assistant"):
+def format_assistant_line(msg, parent=None, bot_id="", bot_name="Assistant",
+                          names=None):
     """Render a bot message as an assistant turn (no author prefix).
 
     The role already conveys the speaker, so only content + media
     markers are emitted — but a reply context is preserved (quoted, like
     user turns) so reply threads don't flatten into standalone
-    statements. Lead marker mimicry in generated output is handled
-    separately by strip_reply_markers. Pure function (no I/O).
+    statements. Mentions resolve like format_history_line. Lead marker
+    mimicry in generated output is handled separately by
+    strip_reply_markers. Pure function (no I/O).
     """
     markers = mem_vision.format_markers(msg.get("attachments"))
-    text = resolve_bot_mentions(msg.get("content", ""), bot_id, bot_name)
+    text = resolve_mentions(msg.get("content", ""), names, bot_id, bot_name)
     if msg.get("reply_to"):
         if parent is not None:
-            ptext = resolve_bot_mentions(
-                str(parent.get("content", "")), bot_id, bot_name
+            ptext = resolve_mentions(
+                str(parent.get("content", "")), names, bot_id, bot_name
             )[:PARENT_TRUNCATE_CHARS]
             text = (
                 f"(replying to {author_label(parent)}: {ptext}): {text}"
@@ -175,7 +196,7 @@ def format_assistant_line(msg, parent=None, bot_id="", bot_name="Assistant"):
 
 def format_turns(history, parent_map=None, current_message_id=None,
                  username="", user_message="", display_name="",
-                 bot_id="", bot_name="Assistant"):
+                 bot_id="", bot_name="Assistant", names=None):
     """Build role-tagged chat turns from the window (oldest -> newest).
 
     User turns keep 'author [display]: ...' labels (needed to tell
@@ -201,11 +222,11 @@ def format_turns(history, parent_map=None, current_message_id=None,
         if m.get("role") == "assistant":
             turns.append({"role": "assistant",
                           "content": format_assistant_line(
-                              m, parent, bot_id, bot_name)})
+                              m, parent, bot_id, bot_name, names)})
         else:
             turns.append({"role": "user",
                           "content": format_history_line(
-                              m, parent, bot_id, bot_name)})
+                              m, parent, bot_id, bot_name, names)})
     current = next(
         (m for m in history
          if current_message_id is not None
@@ -219,11 +240,11 @@ def format_turns(history, parent_map=None, current_message_id=None,
                   if row.get("reply_to") else None)
         turns.append({"role": "user",
                       "content": format_history_line(
-                          row, parent, bot_id, bot_name)})
+                          row, parent, bot_id, bot_name, names)})
     else:
         label = author_label(
             {"author": username, "display_name": display_name})
         turns.append({"role": "user",
                       "content": f"{label}: "
-                                 f"{resolve_bot_mentions(user_message, bot_id, bot_name)}"})
+                                 f"{resolve_mentions(user_message, names, bot_id, bot_name)}"})
     return turns

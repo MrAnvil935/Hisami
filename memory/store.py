@@ -226,6 +226,34 @@ def get_messages_by_ids(channel_id, ids):
     return out
 
 
+def get_display_names(channel_id, ids):
+    """Map author_id -> latest non-empty display_name in this channel.
+
+    Nicknames are per-server, so the lookup is channel-scoped. IDs with
+    no stored non-empty name are simply absent (caller leaves them raw).
+    Empty input short-circuits without touching the DB.
+    """
+    want = {str(i).strip() for i in (ids or ()) if str(i or "").strip()}
+    if not want:
+        return {}
+    q = ",".join("?" for _ in want)
+    con = _connect()
+    try:
+        rows = con.execute(
+            f"""SELECT author_id, display_name FROM messages
+                WHERE channel_id=? AND author_id IN ({q})
+                  AND display_name != ''
+                ORDER BY msg_id ASC""",
+            (str(channel_id), *want),
+        ).fetchall()
+    finally:
+        con.close()
+    out = {}
+    for r in rows:  # ASC so the newest non-empty name wins
+        out[str(r["author_id"])] = r["display_name"]
+    return out
+
+
 def get_messages_before(channel_id, msg_id, limit=3):
     """Messages strictly before msg_id, oldest->newest, up to limit.
 
