@@ -197,9 +197,17 @@ prompt:
   Videos are never processed, but history lines are annotated
   (`[image: foo.png]`, `[video: bar.mp4]`) so the model knows media exists.
 * **Keyword recall** — FTS5 search over past messages, top 3 injected.
-  When a ping replies to a message outside the recent window, this block is
+  Messages already in the live window (and the message being answered) are
+  excluded, and the surviving excerpts are ordered chronologically under a
+  "separate excerpts, not a continuous conversation" header; a recalled
+  reply carries its question inline so the two can't be mislinked. When a
+  ping replies to a message outside the recent window, this block is
   replaced by that message plus preceding context (DB first, Discord fetch
   fallback; fetched messages are stored so memory keeps continuity).
+* **Self-recognition** — the bot's own `<@id>`/`<@!id>` pings render as
+  `@Assistant` everywhere in the chat prompt (history, recall, reply
+  context), so it knows a ping refers to itself; the raw mention is also
+  stripped from the incoming message before assembly.
 
 `/clearmemory` clears only the recent short-term buffer (to unstick a looping
 model); summaries and facts are preserved. `/status` reports buffer,

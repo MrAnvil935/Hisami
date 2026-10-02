@@ -849,12 +849,15 @@ async def get_web_context(channel_id, user_message):
 
 
 async def get_memory_context(channel_id, user_message, author_id="",
-                             username="", reply_block=""):
+                             username="", reply_block="", exclude_ids=None,
+                             bot_id="", bot_name=ASSISTANT_NAME):
     """Fetch long-term memory: summaries + recalled messages + user facts.
 
     Runs SQLite lookups in threads; returns a formatted prompt section.
     When reply_block is set (ping replying to an out-of-window message),
-    it REPLACES the keyword recall block. Fail-soft: any error -> ''.
+    it REPLACES the keyword recall block. exclude_ids are message ids
+    already in the live window (plus the current message) so recall
+    never re-injects them. Fail-soft: any error -> ''.
     """
     query_vec = None
     if MEMORY_SEMANTIC_RANK:
@@ -870,7 +873,7 @@ async def get_memory_context(channel_id, user_message, author_id="",
                 query_vec),
             asyncio.to_thread(
                 mem_recall.search_messages, channel_id, user_message,
-                MEMORY_RECALL_LIMIT) if MEMORY_RECALL_ENABLED
+                MEMORY_RECALL_LIMIT, exclude_ids) if MEMORY_RECALL_ENABLED
             else asyncio.sleep(0, result=[]),
             asyncio.to_thread(
                 mem_store.get_facts, author_id, 5, user_message, query_vec)
@@ -890,11 +893,38 @@ async def get_memory_context(channel_id, user_message, author_id="",
     if reply_block:
         blocks.append(reply_block)
     elif recalled:
-        r_lines = "\n".join(
-            f"- {r.get('author_name', '?')}: {(r.get('content') or '')[:300]}"
-            for r in recalled
-        )
-        blocks.append(f"\nRelevant past messages:\n{r_lines}\n")
+        kept = mem_recall.select_recall(
+            recalled, exclude_ids, MEMORY_RECALL_LIMIT)
+        block = ""
+        if kept:
+            try:
+                # FTS rows lack display_name/reply_to; enrich from the
+                # messages table and pull each excerpt's parent so an
+                # answer can never detach from its question.
+                rows = await asyncio.to_thread(
+                    mem_store.get_messages_by_ids, channel_id,
+                    {r["msg_id"] for r in kept})
+                enriched, parent_ids = [], set()
+                for r in kept:
+                    row = rows.get(r.get("msg_id")) or {}
+                    item = dict(r)
+                    item["display_name"] = row.get("display_name", "")
+                    item["reply_to"] = row.get("reply_to")
+                    enriched.append(item)
+                    if item["reply_to"]:
+                        parent_ids.add(item["reply_to"])
+                parents = {}
+                if parent_ids:
+                    parents = await asyncio.to_thread(
+                        mem_store.get_messages_by_ids, channel_id,
+                        parent_ids)
+                block = mem_recall.render_recalled(
+                    enriched, parents, bot_id, bot_name)
+            except Exception:
+                log.exception("recall enrichment failed")
+                block = ""
+        if block:
+            blocks.append(block)
     if facts:
         f_lines = "\n".join(f"- {f['fact']}" for f in facts)
         who = username.strip() if username and username.strip() else "this user"
@@ -906,7 +936,8 @@ async def get_memory_context(channel_id, user_message, author_id="",
     if MEMORY_FACTS_ENABLED and MEMORY_PEER_MAX_USERS > 0:
         try:
             peer_ids, peer_names = mem_recall.find_referenced_users(
-                recent, author_id, user_message, MEMORY_PEER_MAX_USERS)
+                recent, author_id, user_message, MEMORY_PEER_MAX_USERS,
+                bot_id)
             if peer_ids:
                 peer_facts = await asyncio.gather(*[
                     asyncio.to_thread(
@@ -969,20 +1000,27 @@ def build_system_content(style_block, examples_block, memory_block,
 
 async def build_messages(channel_id, user_message, username, author_id="",
                          image_block="", reply_block="",
-                         current_message_id=None, display_name=""):
+                         current_message_id=None, display_name="",
+                         bot_id="", bot_name=ASSISTANT_NAME):
     """Build the full chat messages list for one reply.
 
     Returns [system] + role-tagged conversation turns (see
     mem_buffer.format_turns). Retrieved context goes into the single
     system message; the live exchange stays as real user/assistant
-    turns so the model can follow the conversation properly.
+    turns so the model can follow the conversation properly. The window
+    is loaded first so recall can exclude messages already in context.
     """
+    history = _history_compat(channel_id)
+    exclude_ids = {m["id"] for m in history}
+    if current_message_id is not None:
+        exclude_ids.add(current_message_id)
+
     # Retrieval, web search and long-term memory are independent.
     examples, web_block, memory_block = await asyncio.gather(
         asyncio.to_thread(retrieve_examples, channel_id, user_message),
         get_web_context(channel_id, user_message),
         get_memory_context(channel_id, user_message, author_id, username,
-                           reply_block),
+                           reply_block, exclude_ids, bot_id, bot_name),
     )
 
     style_block = ""
@@ -1003,8 +1041,6 @@ async def build_messages(channel_id, user_message, username, author_id="",
 
     system_content = build_system_content(
         style_block, examples_block, memory_block, web_block, image_block)
-
-    history = _history_compat(channel_id)
 
     # lookup table for reply context
     msg_map = {m["id"]: m for m in history}
@@ -1035,7 +1071,7 @@ async def build_messages(channel_id, user_message, username, author_id="",
     turns = mem_buffer.format_turns(
         history, msg_map, current_message_id,
         username=username, user_message=user_message,
-        display_name=display_name)
+        display_name=display_name, bot_id=bot_id, bot_name=bot_name)
 
     messages = [{"role": "system", "content": system_content}] + turns
 
@@ -1655,7 +1691,8 @@ def _normalize_fetched(author, content, message_id, attachments=()):
     }
 
 
-async def build_reply_context_block(channel_id, message, target, window_ids):
+async def build_reply_context_block(channel_id, message, target, window_ids,
+                                    bot_id="", bot_name=ASSISTANT_NAME):
     """Replied-to message + preceding context for out-of-window parents.
 
     Returns '' when the ping is not a reply, the parent is already in
@@ -1738,7 +1775,8 @@ async def build_reply_context_block(channel_id, message, target, window_ids):
     if parent is None:
         return ""
     return mem_recall.format_reply_context(
-        parent, previous, REPLY_CONTEXT_PARENT_CHARS, 300)
+        parent, previous, REPLY_CONTEXT_PARENT_CHARS, 300,
+        bot_id, bot_name)
 
 
 async def describe_image(source_key, image_url, question=VISION_QUESTION):
@@ -2960,11 +2998,8 @@ async def on_message(message):
         return
     _last_call[message.author.id] = now
 
-    cleaned = (
-        message.content
-        .replace(f"<@{client.user.id}>", "")
-        .strip()
-    )
+    cleaned = re.sub(
+        rf"<@!?{client.user.id}>", "", message.content).strip()
 
     if not cleaned:
         await message.reply("Say something after pinging me.")
@@ -3017,7 +3052,9 @@ async def on_message(message):
                             _history_compat, message.channel.id)
                         reply_block = await build_reply_context_block(
                             message.channel.id, message, reply_target,
-                            {m["id"] for m in window})
+                            {m["id"] for m in window},
+                            str(client.user.id) if client.user else "",
+                            ASSISTANT_NAME)
                     except Exception:
                         log.exception("reply context failed")
                         reply_block = ""
@@ -3034,6 +3071,8 @@ async def on_message(message):
                     current_message_id=message.id,
                     display_name=str(
                         getattr(message.author, "display_name", "") or ""),
+                    bot_id=str(client.user.id) if client.user else "",
+                    bot_name=ASSISTANT_NAME,
                 )
 
                 log.debug("PROMPT SENT TO MODEL (%d msgs):\n%s\n[END PROMPT]",

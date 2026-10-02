@@ -492,6 +492,48 @@ class BufferTest(TempDBMixin, unittest.TestCase):
         self.assertEqual(
             mem_buffer.strip_reply_markers(original), original)
 
+    def test_resolve_bot_mentions(self):
+        self.assertEqual(
+            mem_buffer.resolve_bot_mentions("hey <@42> sup", "42"),
+            "hey @Assistant sup")
+        self.assertEqual(
+            mem_buffer.resolve_bot_mentions("hey <@!42> sup", "42"),
+            "hey @Assistant sup")
+        self.assertEqual(
+            mem_buffer.resolve_bot_mentions("hey <@43>", "42"),
+            "hey <@43>")
+        self.assertEqual(
+            mem_buffer.resolve_bot_mentions("no mentions", "42"),
+            "no mentions")
+        self.assertEqual(mem_buffer.resolve_bot_mentions("", "42"), "")
+        # no bot id -> passthrough
+        self.assertEqual(
+            mem_buffer.resolve_bot_mentions("<@42>", ""), "<@42>")
+
+    def test_format_history_line_resolves_bot_ping(self):
+        out = mem_buffer.format_history_line(
+            {"author": "alice", "content": "ping <@!42> please"}, None,
+            bot_id="42", bot_name="Assistant")
+        self.assertEqual(out, "alice: ping @Assistant please")
+        # in parent snippet too
+        out = mem_buffer.format_history_line(
+            {"author": "bob", "content": "ok", "reply_to": 1},
+            {"author": "alice", "content": "is <@42> here?"},
+            bot_id="42", bot_name="Assistant")
+        self.assertIn("replying to alice: is @Assistant here?", out)
+
+    def test_format_turns_resolves_and_final_message(self):
+        history = [
+            {"id": 1, "author": "alice", "role": "user",
+             "content": "ping <@42>"},
+        ]
+        turns = mem_buffer.format_turns(
+            history, {}, current_message_id=99,
+            username="bob", user_message="and <@!42>?",
+            bot_id="42", bot_name="Assistant")
+        self.assertEqual(turns[0]["content"], "alice: ping @Assistant")
+        self.assertEqual(turns[-1]["content"], "bob: and @Assistant?")
+
 
 class RecallTest(TempDBMixin, unittest.TestCase):
     def test_fts_recall(self):
@@ -504,6 +546,47 @@ class RecallTest(TempDBMixin, unittest.TestCase):
         hits = mem_recall.search_messages("c1", "skyblock minecraft server")
         self.assertTrue(hits)
         self.assertIn("skyblock", hits[0]["content"])
+
+    def test_search_messages_exclude_ids(self):
+        mem_store.add_message("cx", 1, "u1", "alice", "user",
+                              "minecraft skyblock server down")
+        mem_store.add_message("cx", 2, "u2", "bob", "user",
+                              "minecraft skyblock crash again")
+        hits = mem_recall.search_messages(
+            "cx", "minecraft skyblock", exclude_ids={1, 2})
+        self.assertEqual(hits, [])
+        hits = mem_recall.search_messages(
+            "cx", "minecraft skyblock", exclude_ids={1})
+        self.assertTrue(hits)
+        self.assertTrue(all(h["msg_id"] != 1 for h in hits))
+
+    def test_select_recall_chronological_and_filtered(self):
+        recalled = [
+            {"msg_id": 30, "author_name": "a", "content": "c3"},
+            {"msg_id": 10, "author_name": "b", "content": "c1"},
+            {"msg_id": 20, "author_name": "c", "content": "c2"},
+        ]
+        kept = mem_recall.select_recall(recalled, exclude_ids={20}, limit=5)
+        self.assertEqual([r["msg_id"] for r in kept], [10, 30])
+        # cap applies after ordering (keeps oldest)
+        kept = mem_recall.select_recall(recalled, None, limit=2)
+        self.assertEqual([r["msg_id"] for r in kept], [10, 20])
+
+    def test_render_recalled_frames_and_links(self):
+        recalled = [
+            {"msg_id": 2, "author_name": "alice", "content": "yes it is",
+             "reply_to": 1},
+            {"msg_id": 4, "author_name": "bob",
+             "content": "ping <@999> now"},
+        ]
+        parents = {1: {"author_name": "carol", "content": "is this real?"}}
+        out = mem_recall.render_recalled(
+            recalled, parents, bot_id="999", bot_name="Assistant")
+        self.assertIn("not a continuous conversation", out)
+        self.assertIn("(replying to carol: is this real?): yes it is", out)
+        self.assertIn("@Assistant", out)
+        self.assertNotIn("<@999>", out)
+        self.assertEqual(mem_recall.render_recalled([], {}, "1", "A"), "")
 
     def test_rank_by_overlap(self):
         items = [
@@ -656,6 +739,19 @@ class RecallTest(TempDBMixin, unittest.TestCase):
             msgs, "u2", "what is everyone up to?", max_users=2)
         self.assertEqual(ids, ["u1"])
         self.assertNotIn("b", ids)
+
+    def test_referenced_users_excludes_bot_id(self):
+        msgs = [
+            {"author_id": "42", "author_name": "Hisami", "role": "user",
+             "content": "hi"},
+            {"author_id": "u1", "author_name": "alice", "role": "user",
+             "content": "hey"},
+        ]
+        # bot mention in the text is not treated as a peer
+        ids, _ = mem_recall.find_referenced_users(
+            msgs, "u9", "ping <@42> and alice", max_users=3, bot_id="42")
+        self.assertNotIn("42", ids)
+        self.assertIn("u1", ids)
 
     def test_referenced_users_cap_and_self(self):
         msgs = [

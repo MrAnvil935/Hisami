@@ -129,15 +129,19 @@ def rank_hybrid(items, query, query_vec=None, text_key="fact",
     return [s[2] for s in scored]
 
 
-def search_messages(channel_id, query, limit=5):
+def search_messages(channel_id, query, limit=5, exclude_ids=None):
     """Return up to `limit` past messages relevant to query.
 
     Each item: {msg_id, author_name, content, score}. Newest irrelevant
     chatter is excluded by ranking on match quality, not recency.
+    exclude_ids (message ids already present in the live window) are
+    filtered out so recall never re-injects context the prompt already
+    has — including the message currently being answered.
     """
     tokens = tokenize(query)
     if not tokens:
         return []
+    excluded = {str(x) for x in (exclude_ids or ())}
     con = sqlite3.connect(store.DB_PATH, timeout=10)
     con.row_factory = sqlite3.Row
     try:
@@ -153,13 +157,17 @@ def search_messages(channel_id, query, limit=5):
             ).fetchall()
             # FTS5 rank: more negative = better. Normalize for display.
             out = []
-            for r in rows[: int(limit)]:
+            for r in rows:
+                if str(r["msg_id"]) in excluded:
+                    continue
                 d = dict(r)
                 try:
                     d["score"] = -float(d.get("score", 0.0))
                 except (TypeError, ValueError):
                     d["score"] = 0.0
                 out.append(d)
+                if len(out) >= int(limit):
+                    break
             if out:
                 return out
         except sqlite3.OperationalError:
@@ -171,14 +179,74 @@ def search_messages(channel_id, query, limit=5):
             f"""SELECT channel_id, msg_id, author_name, content, 0.0 AS score
                 FROM messages WHERE channel_id=? AND ({likes})
                 ORDER BY msg_id DESC LIMIT ?""",
-            (str(channel_id), *params, int(limit)),
+            (str(channel_id), *params, int(limit) * 3),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in rows
+                if str(r["msg_id"]) not in excluded][:int(limit)]
     finally:
         con.close()
 
 
-def find_referenced_users(messages, author_id, current_text="", max_users=2):
+def select_recall(recalled, exclude_ids=None, limit=3):
+    """Filter, order chronologically (oldest->newest), and cap recall.
+
+    Chronological order keeps the excerpts readable as a timeline rather
+    than a random-ranked list, so an answer can't be mislinked to the
+    wrong question. exclude_ids drops rows already in the live window.
+    Pure function (no I/O) so it is unit-testable.
+    """
+    excluded = {str(x) for x in (exclude_ids or ())}
+    kept = [r for r in (recalled or [])
+            if str(r.get("msg_id")) not in excluded]
+    kept.sort(key=lambda r: _sort_key(r.get("msg_id")))
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 3
+    return kept[:max(0, limit)]
+
+
+def _sort_key(msg_id):
+    try:
+        return (0, int(msg_id))
+    except (TypeError, ValueError):
+        return (1, str(msg_id or ""))
+
+
+def render_recalled(kept, parents=None, bot_id="", bot_name="Assistant"):
+    """Render recall excerpts with explicit framing and reply linkage.
+
+    Header states these are separate excerpts, not a continuous
+    conversation. Any excerpt that is a reply carries its question
+    inline so the two can't be detached. Bot mentions resolve to
+    @bot_name. Empty input -> ''. Pure function (no I/O).
+    """
+    if not kept:
+        return ""
+    parents = parents or {}
+    lines = []
+    for r in kept:
+        content = mem_buffer.resolve_bot_mentions(
+            r.get("content", ""), bot_id, bot_name)
+        label = mem_buffer.author_label(r)
+        parent = parents.get(r.get("reply_to")) if r.get("reply_to") else None
+        if parent is not None:
+            ptext = mem_buffer.resolve_bot_mentions(
+                str(parent.get("content") or ""), bot_id, bot_name
+            )[:mem_buffer.PARENT_TRUNCATE_CHARS]
+            lines.append(
+                f"- {label} (replying to "
+                f"{mem_buffer.author_label(parent)}: {ptext}): {content}")
+        else:
+            lines.append(f"- {label}: {content}")
+    return (
+        "\nRelevant past messages (separate excerpts, not a continuous "
+        "conversation):\n" + "\n".join(lines) + "\n"
+    )
+
+
+def find_referenced_users(messages, author_id, current_text="", max_users=2,
+                          bot_id=""):
     """Find OTHER users relevant to the current message.
 
     Sources, in priority order:
@@ -187,15 +255,17 @@ def find_referenced_users(messages, author_id, current_text="", max_users=2):
       3. other recent human speakers, newest first.
 
     Returns (ordered_ids, names) where names maps id -> display name.
-    The message author (author_id) and assistant rows are always excluded.
-    Pure function (no I/O) so it is unit-testable.
+    The message author (author_id), the bot itself (bot_id), and
+    assistant rows are always excluded. Pure function (no I/O) so it is
+    unit-testable.
     """
     self_id = str(author_id or "")
+    skip_ids = {self_id, str(bot_id or "")} - {""}
     ordered, names = [], {}
 
     def _add(uid, name=""):
         uid = str(uid or "").strip()
-        if not uid or uid == self_id or uid in ordered:
+        if not uid or uid in skip_ids or uid in ordered:
             return
         if len(ordered) >= max_users:
             return
@@ -216,7 +286,7 @@ def find_referenced_users(messages, author_id, current_text="", max_users=2):
             continue
         uid = str(m.get("author_id") or "").strip()
         name = str(m.get("author_name") or "").strip()
-        if not uid or uid == self_id:
+        if not uid or uid in skip_ids:
             continue
         speakers.append((uid, name))
         if name and uid not in names:
@@ -261,20 +331,22 @@ def channel_engaged(messages, bot_id, lookback=30):
     return False
 
 
-def format_reply_context(parent, previous, parent_chars=500, ctx_chars=300):
+def format_reply_context(parent, previous, parent_chars=500, ctx_chars=300,
+                         bot_id="", bot_name="Assistant"):
     """Render a replied-to message + preceding context for the prompt.
 
     parent: dict with author_name/content (DB row or fetched message data).
     previous: list of similar dicts, oldest->newest. Returns '' when the
     parent is missing/empty (caller keeps keyword recall instead).
-    Pure function (no I/O) so it is unit-testable.
+    Bot mentions resolve to @bot_name. Pure function (no I/O) so it is
+    unit-testable.
     """
     if not parent or not str(parent.get("content") or "").strip():
         return ""
     lines = [
         "Replied-to message:",
         f"{mem_buffer.author_label(parent)}: "
-        f"{str(parent.get('content') or '')[:parent_chars]}",
+        f"{mem_buffer.resolve_bot_mentions(str(parent.get('content') or ''), bot_id, bot_name)[:parent_chars]}",
     ]
     ctx = [m for m in (previous or [])
            if str(m.get("content") or "").strip()]
@@ -282,7 +354,7 @@ def format_reply_context(parent, previous, parent_chars=500, ctx_chars=300):
         lines.append("Previous context:")
         lines.extend(
             f"{mem_buffer.author_label(m)}: "
-            f"{str(m.get('content') or '')[:ctx_chars]}"
+            f"{mem_buffer.resolve_bot_mentions(str(m.get('content') or ''), bot_id, bot_name)[:ctx_chars]}"
             for m in ctx
         )
     return "\n" + "\n".join(lines) + "\n"
