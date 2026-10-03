@@ -91,7 +91,8 @@ def apply_config(cfg, initial=False):
     global EXAMPLES_MAX_TOKENS, FACT_INPUT_CHARS, FALLBACK_MODEL
     global LLM_DUMP_ENABLED, LOG_BACKUPS, LOG_DIR, LOG_FILE_LEVEL
     global LOG_MAX_BYTES, MASTER_PROMPT, MAX_EXAMPLES, MAX_HISTORY
-    global MAX_OLLAMA_TOKENS, MEMORY_BUFFER_MAX_MSGS, MEMORY_BUFFER_TOKENS
+    global MAX_OLLAMA_TOKENS, BUFFER_MERGE_GAP_SECONDS
+    global MEMORY_BUFFER_MAX_MSGS, MEMORY_BUFFER_TOKENS
     global MEMORY_DB_PATH, MEMORY_ENGAGE_LOOKBACK, MEMORY_FACTS_ENABLED
     global MEMORY_PEER_MAX_FACTS, MEMORY_PEER_MAX_USERS, MEMORY_PRUNE_KEEP
     global MEMORY_RECALL_ENABLED, MEMORY_RECALL_LIMIT, MEMORY_SEMANTIC_RANK
@@ -162,6 +163,10 @@ def apply_config(cfg, initial=False):
     MEMORY_DB_PATH = cfg.get("memory_db_path", "memory.db")
     MEMORY_BUFFER_TOKENS = cfg.get("memory_buffer_tokens", 1500)
     MEMORY_BUFFER_MAX_MSGS = cfg.get("memory_buffer_max_msgs", 30)
+    # Consecutive same-author messages within this many seconds merge
+    # into one window slot (0 disables). Stops a split-up thought from
+    # eating the whole max_messages budget.
+    BUFFER_MERGE_GAP_SECONDS = cfg.get("buffer_merge_gap_seconds", 180)
     MEMORY_SUMMARY_CHUNK = cfg.get("memory_summary_chunk", 30)
     MEMORY_ENGAGE_LOOKBACK = cfg.get("memory_engage_lookback", 30)
     MEMORY_SUMMARY_CHUNK_TOKENS = cfg.get("memory_summary_chunk_tokens", 3000)
@@ -431,25 +436,30 @@ indexed_tokens = [set(text.lower().split()) for text in indexed_texts]
 # Summaries + user_facts provide long-term memory. See memory/ package.
 
 
-def _history_compat(channel_id):
+def _history_compat(channel_id, current_message_id=None):
     """Return history in the legacy dict shape for prompt builders.
 
-    Legacy keys: id / author / role / content / reply_to.
+    Legacy keys: id / author / role / content / reply_to. The live
+    message (current_message_id) is kept out of any fragment merge.
     """
     rows = mem_buffer.load_window(
         channel_id,
         budget_tokens=MEMORY_BUFFER_TOKENS,
         max_messages=MEMORY_BUFFER_MAX_MSGS,
+        max_gap_s=BUFFER_MERGE_GAP_SECONDS,
+        break_ids={current_message_id} if current_message_id else None,
     )
     return [
         {
             "id": r["msg_id"],
+            "ids": r.get("ids") or [r["msg_id"]],
             "author": r["author_name"],
             "author_id": r.get("author_id", ""),
             "display_name": r.get("display_name", ""),
             "role": r.get("role", "user"),
             "content": r.get("content", ""),
             "reply_to": r.get("reply_to"),
+            "created_at": r.get("created_at"),
             "attachments": r.get("attachments") or [],
         }
         for r in rows
@@ -1039,8 +1049,9 @@ async def build_messages(channel_id, user_message, username, author_id="",
     turns so the model can follow the conversation properly. The window
     is loaded first so recall can exclude messages already in context.
     """
-    history = _history_compat(channel_id)
+    history = _history_compat(channel_id, current_message_id)
     exclude_ids = {m["id"] for m in history}
+    exclude_ids.update(i for m in history for i in (m.get("ids") or []))
     if current_message_id is not None:
         exclude_ids.add(current_message_id)
 
@@ -1071,8 +1082,13 @@ async def build_messages(channel_id, user_message, username, author_id="",
     system_content = build_system_content(
         style_block, examples_block, memory_block, web_block, image_block)
 
-    # lookup table for reply context
-    msg_map = {m["id"]: m for m in history}
+    # lookup table for reply context: merged units are reachable by any
+    # of their constituent message ids, so a reply to a middle fragment
+    # resolves to the merged turn instead of refetching a duplicate.
+    msg_map = {}
+    for m in history:
+        for mid in (m.get("ids") or [m["id"]]):
+            msg_map[mid] = m
 
     # Recover reply parents that fell outside the prompt window but are
     # still in the (larger) DB buffer — one bulk fetch, only when needed.

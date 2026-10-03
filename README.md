@@ -212,7 +212,12 @@ prompt:
   the plain-text form can't re-ping anyone.
 
 `/clearmemory` clears only the recent short-term buffer (to unstick a looping
-model); summaries and facts are preserved. `/status` reports buffer,
+model); summaries and facts are preserved. Consecutive messages from the
+same author within `buffer_merge_gap_seconds` (default 180, 0 disables)
+merge into one window slot, so a thought split across many messages
+doesn't blow `memory_buffer_max_msgs`. Messages that are replies never
+merge, and the live message always stays its own turn (so a response
+is never folded into a neighbour's text). `/status` reports buffer,
 summary, fact and DB sizes plus model load states. `/reload` re-reads
 `config.json` without restarting (admin only, ephemeral reply): model
 names, temperatures, token budgets, timeouts, prompts, and presence apply

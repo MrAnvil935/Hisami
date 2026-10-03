@@ -13,7 +13,7 @@
   // prefix caching). Stale caches can serve warmed-up prefixes that make
   // the bot ignore fresh conversation. Tradeoff: no cache-read discounts,
   // every call bills full input price. Flip off if a provider 400s.
-  "openrouter_no_cache": false,
+  "openrouter_no_cache": true,
 
   // Primary chat model (OpenRouter). Used when the local ollama_model
   // below is not loaded.
@@ -44,6 +44,10 @@
   // but bigger prompts.
   "memory_buffer_tokens": 1500,
   "memory_buffer_max_msgs": 30,
+  // Consecutive messages from the same author within this many seconds
+  // merge into one window slot, so a thought split across many messages
+  // doesn't blow the max_messages cap. 0 disables merging.
+  "buffer_merge_gap_seconds": 180,
   // Messages per channel summarized into one long-term summary chunk.
   "memory_summary_chunk": 30,
   // Channels with no bot mention in the last N messages skip background

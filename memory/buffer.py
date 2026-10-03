@@ -90,18 +90,99 @@ def message_tokens(msg: dict) -> int:
         + estimate_tokens(str(msg.get("content", ""))) + 4  # role/format overhead
 
 
-def load_window(channel_id, budget_tokens=1500, max_messages=30, fetch_limit=120):
+def _row_time(msg):
+    try:
+        return float(msg.get("created_at"))
+    except (TypeError, ValueError):
+        return None
+
+
+def merge_fragments(rows, max_gap_s=180, break_ids=None):
+    """Merge consecutive same-author user fragments into logical messages.
+
+    A split-up thought ("hey", "wait", "ok so") otherwise burns one
+    window slot per fragment. Rows oldest->newest in, merged units out.
+    Only role == 'user' rows merge, and only when author_id matches and
+    the gap between them is 0..max_gap_s seconds (bad/missing timestamps
+    never merge). Assistant turns are never fused. max_gap_s <= 0
+    disables merging entirely.
+
+    Barriers that always stay their own unit (never merged with a
+    neighbour): break_ids (e.g. the live ping being answered) and any
+    row that is itself a reply (reply_to set) — a reply is a targeted
+    response, so fusing it would blur what it was answering. Pure
+    function (no I/O).
+    """
+    try:
+        gap_limit = float(max_gap_s)
+    except (TypeError, ValueError):
+        gap_limit = 180.0
+    if gap_limit <= 0:
+        return [dict(r) for r in (rows or [])]
+    breaks = {str(b) for b in (break_ids or ())}
+
+    merged = []
+    sealed_prev = False
+    for row in rows or []:
+        row = dict(row)
+        row.setdefault("ids", [row.get("msg_id")])
+        is_break = str(row.get("msg_id")) in breaks
+        is_reply = row.get("reply_to") is not None
+        prev = merged[-1] if merged else None
+        same_author = (
+            prev is not None and not sealed_prev
+            and not is_break and not is_reply
+            and prev.get("reply_to") is None
+            and prev.get("role") == "user" and row.get("role") == "user"
+            and str(prev.get("author_id") or "").strip()
+            and str(prev.get("author_id")) == str(row.get("author_id"))
+        )
+        close = False
+        if same_author:
+            t_prev, t_row = _row_time(prev), _row_time(row)
+            close = (t_prev is not None and t_row is not None
+                     and 0 <= (t_row - t_prev) <= gap_limit)
+
+        if close:
+            joined = dict(row)
+            joined["content"] = (
+                f"{prev.get('content', '')}\n{row.get('content', '')}".strip()
+            )
+            joined["attachments"] = (
+                list(prev.get("attachments") or [])
+                + list(row.get("attachments") or [])
+            )
+            joined["reply_to"] = (prev.get("reply_to")
+                                  if prev.get("reply_to") is not None
+                                  else row.get("reply_to"))
+            joined["ids"] = (list(prev.get("ids") or [])
+                             + list(row.get("ids") or []))
+            joined["msg_id"] = row.get("msg_id")
+            merged[-1] = joined
+            sealed_prev = False
+            continue
+        merged.append(row)
+        sealed_prev = is_break or is_reply
+    return merged
+
+
+def load_window(channel_id, budget_tokens=1500, max_messages=30,
+                fetch_limit=120, max_gap_s=180, break_ids=None):
     """Load most recent messages that fit into the token budget.
 
-    Returns oldest->newest list. Always keeps at least the newest message.
+    Consecutive same-author user fragments are merged first, so a single
+    thought split across many messages costs one window slot. break_ids
+    (e.g. the live message) stay standalone. Returns oldest->newest list.
+    Always keeps at least the newest message.
     """
     recent = store.get_recent(channel_id, limit=fetch_limit)
     if not recent:
         return []
+    units = merge_fragments(recent, max_gap_s, break_ids)
     # newest-first walk, then reverse
     picked = []
     used = 0
-    for msg in reversed(recent):
+    for msg in reversed(units):
         t = message_tokens(msg)
         if picked and (used + t > budget_tokens or len(picked) >= max_messages):
             break
@@ -212,10 +293,15 @@ def format_turns(history, parent_map=None, current_message_id=None,
     """
     parent_map = parent_map or {}
     history = history or []
+
+    def _is_current(m):
+        if current_message_id is None:
+            return False
+        return current_message_id in (m.get("ids") or [m.get("id")])
+
     turns = []
     for m in history:
-        if (current_message_id is not None
-                and m.get("id") == current_message_id):
+        if _is_current(m):
             continue
         parent = (parent_map.get(m.get("reply_to"))
                   if m.get("reply_to") else None)
@@ -227,12 +313,7 @@ def format_turns(history, parent_map=None, current_message_id=None,
             turns.append({"role": "user",
                           "content": format_history_line(
                               m, parent, bot_id, bot_name, names)})
-    current = next(
-        (m for m in history
-         if current_message_id is not None
-         and m.get("id") == current_message_id),
-        None,
-    )
+    current = next((m for m in history if _is_current(m)), None)
     if current is not None:
         row = dict(current)
         row["content"] = user_message

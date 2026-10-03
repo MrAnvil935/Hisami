@@ -240,6 +240,113 @@ class StoreTest(TempDBMixin, unittest.TestCase):
 
 
 class BufferTest(TempDBMixin, unittest.TestCase):
+    def test_merge_fragments_break_ids_standalone(self):
+        rows = [
+            {"msg_id": 1, "author_id": "u1", "role": "user",
+             "content": "a", "created_at": 100.0},
+            {"msg_id": 2, "author_id": "u1", "role": "user",
+             "content": "b", "created_at": 101.0},
+        ]
+        merged = mem_buffer.merge_fragments(rows, 180, break_ids={2})
+        self.assertEqual([m["msg_id"] for m in merged], [1, 2])
+
+    def test_merge_fragments_burst(self):
+        rows = [
+            {"msg_id": 1, "author_id": "u1", "role": "user",
+             "content": "hey", "created_at": 100.0},
+            {"msg_id": 2, "author_id": "u1", "role": "user",
+             "content": "wait", "created_at": 110.0},
+            {"msg_id": 3, "author_id": "u1", "role": "user",
+             "content": "ok so", "created_at": 120.0},
+        ]
+        merged = mem_buffer.merge_fragments(rows, max_gap_s=180)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["content"], "hey\nwait\nok so")
+        self.assertEqual(merged[0]["ids"], [1, 2, 3])
+        self.assertEqual(merged[0]["msg_id"], 3)
+        self.assertEqual(merged[0]["created_at"], 120.0)
+
+    def test_merge_fragments_replies_are_barriers(self):
+        rows = [
+            {"msg_id": 1, "author_id": "u1", "role": "user",
+             "content": "a", "created_at": 100.0},
+            {"msg_id": 2, "author_id": "u1", "role": "user",
+             "content": "b", "created_at": 101.0},
+            {"msg_id": 3, "author_id": "u1", "role": "user",
+             "content": "replying now", "reply_to": 1,
+             "created_at": 102.0},
+            {"msg_id": 4, "author_id": "u1", "role": "user",
+             "content": "after", "created_at": 103.0},
+        ]
+        merged = mem_buffer.merge_fragments(rows, 180)
+        # a+b fuse; the reply stays alone and seals the next row too
+        self.assertEqual([m["msg_id"] for m in merged], [2, 3, 4])
+        self.assertEqual(merged[0]["ids"], [1, 2])
+
+    def test_merge_fragments_gap_exceeded(self):
+        rows = [
+            {"msg_id": 1, "author_id": "u1", "role": "user",
+             "content": "a", "created_at": 100.0},
+            {"msg_id": 2, "author_id": "u1", "role": "user",
+             "content": "b", "created_at": 400.0},
+        ]
+        merged = mem_buffer.merge_fragments(rows, max_gap_s=180)
+        self.assertEqual(len(merged), 2)
+
+    def test_merge_fragments_assistant_and_author_breaks(self):
+        rows = [
+            {"msg_id": 1, "author_id": "u1", "role": "user",
+             "content": "a", "created_at": 100.0},
+            {"msg_id": 2, "author_id": "bot", "role": "assistant",
+             "content": "reply", "created_at": 101.0},
+            {"msg_id": 3, "author_id": "u1", "role": "user",
+             "content": "b", "created_at": 102.0},
+            {"msg_id": 4, "author_id": "u2", "role": "user",
+             "content": "c", "created_at": 103.0},
+        ]
+        merged = mem_buffer.merge_fragments(rows, max_gap_s=180)
+        self.assertEqual([m["msg_id"] for m in merged], [1, 2, 3, 4])
+
+    def test_merge_fragments_concat_attachments(self):
+        rows = [
+            {"msg_id": 1, "author_id": "u1", "role": "user", "content": "a",
+             "created_at": 100.0,
+             "attachments": [{"kind": "image", "name": "x.png"}]},
+            {"msg_id": 2, "author_id": "u1", "role": "user", "content": "b",
+             "created_at": 101.0,
+             "attachments": [{"kind": "image", "name": "y.png"}]},
+        ]
+        merged = mem_buffer.merge_fragments(rows, max_gap_s=180)
+        self.assertEqual([a["name"] for a in merged[0]["attachments"]],
+                         ["x.png", "y.png"])
+
+    def test_merge_fragments_bad_timestamp_and_disabled(self):
+        rows = [
+            {"msg_id": 1, "author_id": "u1", "role": "user", "content": "a"},
+            {"msg_id": 2, "author_id": "u1", "role": "user", "content": "b"},
+        ]
+        # missing timestamps never merge
+        self.assertEqual(len(mem_buffer.merge_fragments(rows, 180)), 2)
+        # 0 disables merging entirely
+        stamp = [dict(r, created_at=100.0) for r in rows]
+        self.assertEqual(len(mem_buffer.merge_fragments(stamp, 0)), 2)
+
+    def test_window_merge_frees_message_cap(self):
+        for i in range(10):  # one thought split into 10 rapid fragments
+            mem_store.add_message(
+                "cw", 100 + i, "u1", "alice", "user", f"frag {i}",
+                created_at=1000.0 + i)
+        for i in range(25):  # 25 other messages
+            mem_store.add_message(
+                "cw", 200 + i, f"u{i}", f"user{i}", "user",
+                f"other {i}", created_at=2000.0 + i)
+        window = mem_buffer.load_window(
+            "cw", budget_tokens=100000, max_messages=30, max_gap_s=180)
+        # 1 merged fragment unit + 25 others (35 raw rows would not fit)
+        self.assertEqual(len(window), 26)
+        self.assertIn("frag 0", window[0]["content"])
+        self.assertIn("frag 9", window[0]["content"])
+
     def test_token_budget_trims_oldest(self):
         self._seed(n=20)
         window = mem_buffer.load_window(
