@@ -207,6 +207,47 @@ def author_label(msg):
     return name
 
 
+def format_image_note(description, source=""):
+    """Render one attached-image note for a conversation turn.
+
+    The note belongs in the user turn (not the system block) so the
+    model sees the description attached to the exact message it has to
+    answer. `source` is a short origin phrase such as 'attached by alice'
+    or 'from the message being replied to'. Empty description -> ''.
+    Pure function (no I/O).
+    """
+    desc = str(description or "").strip()
+    if not desc:
+        return ""
+    src = f" {source.strip()}" if str(source or "").strip() else ""
+    return f"[Attached image{src} — contents described: {desc}]"
+
+
+def attach_image_note(content, descriptions):
+    """Append image note(s) to a turn's text, each on its own line.
+
+    `descriptions` is an iterable of {'desc', 'source'} dicts (or
+    (desc, source) pairs). Returns `content` unchanged when there are no
+    usable notes, so image-free turns stay byte-identical to before.
+    Pure function (no I/O).
+    """
+    notes = []
+    for item in descriptions or ():
+        if isinstance(item, dict):
+            note = format_image_note(item.get("desc"), item.get("source", ""))
+        else:
+            parts = list(item) if isinstance(item, (list, tuple)) else [item]
+            desc = parts[0] if parts else ""
+            source = parts[1] if len(parts) > 1 else ""
+            note = format_image_note(desc, source)
+        if note:
+            notes.append(note)
+    if not notes:
+        return content
+    base = str(content or "").strip()
+    return "\n".join([base] + notes) if base else "\n".join(notes)
+
+
 def format_history_line(msg, parent=None, bot_id="", bot_name="Assistant",
                         names=None):
     """Render one window message for the prompt.

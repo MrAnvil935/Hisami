@@ -193,9 +193,14 @@ prompt:
   whole-word and nickname-tolerant (`nos` matches speaker `nos_yous`).
 * **Image understanding** — the first image in a ping (upload, link, or
   replied-to message) is downscaled to 512px and described by a separate
-  local-first vision chain; descriptions are cached by source URL.
-  Videos are never processed, but history lines are annotated
-  (`[image: foo.png]`, `[video: bar.mp4]`) so the model knows media exists.
+  local-first vision chain; descriptions are cached by source URL. The
+  description is appended to the *user turn* that carried the image as an
+  `[Attached image … — contents described: …]` note (attribution tracks
+  whether it was the author's own upload/link or the replied-to message),
+  not buried in the system block, so the model reads it as part of the
+  message it must answer. Videos are never processed, but history lines
+  are annotated (`[image: foo.png]`, `[video: bar.mp4]`) so the model
+  knows media exists.
 * **Keyword recall** — FTS5 search over past messages, top 3 injected.
   Messages already in the live window (and the message being answered) are
   excluded, and the surviving excerpts are ordered chronologically under a
@@ -246,13 +251,18 @@ The `system` message holds, in order:
    framed as tone references that must never be answered
 4. `Reference memory:` summaries, recalled messages or the reply-context
    block, and author/peer facts
-5. Web results (if a search trigger fired) and the image description
-6. A closing line telling the model the above is background context
+5. Web results (if a search trigger fired)
+6. A closing line telling the model the above is background context and
+   that any `[Attached image …]` note in the final user turn is the
+   image's actual contents
 
 Then the conversation turns: user turns render as
 `account [display]: message` (bracket skipped when the nickname equals
 the account name; same format in the replied-to context block), bot
-turns as plain `assistant` content. Replies render the quoted form
+turns as plain `assistant` content. An image description is appended to
+the final user turn as an `[Attached image …]` note (not to the system
+block), so it travels with the message it belongs to. Replies render the
+quoted form
 `(replying to <author>: <truncated parent>)` for both roles; unresolved
 parents show the stale marker. Because a style-mimicking model
 sometimes copies that marker into its own output, a leading reply

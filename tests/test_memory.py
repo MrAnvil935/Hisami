@@ -283,6 +283,37 @@ class BufferTest(TempDBMixin, unittest.TestCase):
         self.assertEqual([m["msg_id"] for m in merged], [2, 3, 4])
         self.assertEqual(merged[0]["ids"], [1, 2])
 
+    def test_format_image_note(self):
+        self.assertEqual(
+            mem_buffer.format_image_note("a cat", "attached by alice"),
+            "[Attached image attached by alice — contents described: a cat]")
+        self.assertEqual(
+            mem_buffer.format_image_note("a cat"),
+            "[Attached image — contents described: a cat]")
+        self.assertEqual(mem_buffer.format_image_note(""), "")
+        self.assertEqual(mem_buffer.format_image_note(None), "")
+
+    def test_attach_image_note_noop_without_images(self):
+        self.assertEqual(mem_buffer.attach_image_note("hello", []), "hello")
+        self.assertEqual(mem_buffer.attach_image_note("hello", None), "hello")
+        self.assertEqual(
+            mem_buffer.attach_image_note("hello", [{"desc": ""}]), "hello")
+
+    def test_attach_image_note_appends_to_turn(self):
+        out = mem_buffer.attach_image_note(
+            "alice: look at this",
+            [{"desc": "a red fox", "source": "attached by alice"}])
+        self.assertEqual(
+            out,
+            "alice: look at this\n"
+            "[Attached image attached by alice — contents described: a red fox]")
+
+    def test_attach_image_note_empty_text_and_tuple_form(self):
+        out = mem_buffer.attach_image_note(
+            "", [("a red fox", "attached by alice")])
+        self.assertEqual(
+            out, "[Attached image attached by alice — contents described: a red fox]")
+
     def test_merge_fragments_gap_exceeded(self):
         rows = [
             {"msg_id": 1, "author_id": "u1", "role": "user",
