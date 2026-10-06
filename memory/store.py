@@ -19,6 +19,14 @@ import time
 
 DB_PATH = "memory.db"
 
+
+def _num(value):
+    """Best-effort float for sorting timestamps/values; 0.0 on bad input."""
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 
@@ -404,12 +412,15 @@ def get_summary_count(channel_id=None):
 def search_summaries(channel_id, query, limit=2, query_vec=None):
     """Keyword search over summaries, upgraded to hybrid when query_vec given.
 
-    Without a query vector this is the legacy LIKE scorer. With one,
-    candidates rank by semantic similarity + keyword boost (same weights
-    as style-example retrieval); rows lacking embeddings score keywords
-    only. Falls back to latest summaries when nothing matches.
+    Scans the channel's full summary history (curated by the background
+    pruner, so this stays bounded in practice). Candidates rank by
+    semantic similarity + keyword boost (same weights as style-example
+    retrieval); rows lacking embeddings score keywords only. A recency
+    floor guarantees the newest half of the budget always injects, and
+    the rest come from the ranked matches. Falls back to the latest
+    summary when nothing shows any signal.
     """
-    from .recall import rank_hybrid, tokenize
+    from .recall import rank_hybrid, split_recent_relevant, tokenize
 
     tokens = tokenize(query)[:6]
     if not tokens and query_vec is None:
@@ -418,7 +429,7 @@ def search_summaries(channel_id, query, limit=2, query_vec=None):
     try:
         rows = con.execute(
             "SELECT chunk_id, summary, msg_from, msg_to, created_at, embedding"
-            " FROM summaries WHERE channel_id=? ORDER BY chunk_id DESC LIMIT 200",
+            " FROM summaries WHERE channel_id=? ORDER BY chunk_id DESC",
             (str(channel_id),),
         ).fetchall()
     finally:
@@ -431,17 +442,21 @@ def search_summaries(channel_id, query, limit=2, query_vec=None):
             if score:
                 scored.append((score, r["chunk_id"], dict(r)))
         scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
-        out = [s[2] for s in scored[:limit]]
-        if not out:
+        ranked = [s[2] for s in scored]
+        if not ranked:
             return get_latest_summaries(channel_id, min(limit, 1))
-        return out
+        return split_recent_relevant(
+            [dict(r) for r in rows], limit, time_key="created_at",
+            id_key="chunk_id", relevance=ranked)
     ranked = rank_hybrid(
         [dict(r) for r in rows], query, query_vec,
         text_key="summary", time_key="created_at", vec_key="embedding")
-    out = ranked[:limit]
-    if not any(_has_signal(r, query, query_vec) for r in out):
+    strong = [r for r in ranked if _has_signal(r, query, query_vec)]
+    if not strong:
         return get_latest_summaries(channel_id, min(limit, 1))
-    return out
+    return split_recent_relevant(
+        ranked, limit, time_key="created_at", id_key="chunk_id",
+        relevance=strong)
 
 
 def _has_signal(row, query, query_vec, text_key="summary"):
@@ -479,44 +494,46 @@ def upsert_fact(user_id, fact, confidence=1.0, embedding=None):
 
 
 def get_facts(user_id, limit=5, query=None, query_vec=None):
+    """Author's facts for prompt injection, full history scanned.
+
+    Ranks the user's entire (pruner-curated) fact set, then splits the
+    budget: the newest ceil(limit/2) facts always inject, the rest come
+    from the relevance rank. Old strong matches stay reachable, but
+    recent facts can never be crowded out entirely. Signal-less relevant
+    slots backfill by recency. No query -> pure recency. Pure-ish (one
+    DB read, no scoring I/O).
+    """
     con = _connect()
     try:
-        if query and query_vec is not None:
-            # hybrid path: semantic + keyword over a bounded recency pool
-            from .recall import rank_hybrid
-            rows = con.execute(
-                """SELECT fact, confidence, updated_at, embedding FROM user_facts
-                   WHERE user_id=? ORDER BY confidence DESC, updated_at DESC
-                   LIMIT 100""",
-                (str(user_id),),
-            ).fetchall()
-            return rank_hybrid(
-                [dict(r) for r in rows], query, query_vec,
-                text_key="fact", time_key="updated_at",
-                vec_key="embedding")[:int(limit)]
-        if query:
-            # relevance path: rank a bounded recency pool by keyword
-            # overlap so topical (even old) facts win; pure recency
-            # tiebreak preserves legacy order when nothing matches.
-            from .recall import rank_by_overlap
-            rows = con.execute(
-                """SELECT fact, confidence, updated_at FROM user_facts
-                   WHERE user_id=? ORDER BY confidence DESC, updated_at DESC
-                   LIMIT 100""",
-                (str(user_id),),
-            ).fetchall()
-            ranked = rank_by_overlap(
-                [dict(r) for r in rows], query,
-                text_key="fact", time_key="updated_at")
-            return ranked[:int(limit)]
         rows = con.execute(
-            """SELECT fact, confidence, updated_at, embedding FROM user_facts
-               WHERE user_id=? ORDER BY confidence DESC, updated_at DESC LIMIT ?""",
-            (str(user_id), int(limit)),
+            "SELECT fact, confidence, updated_at, embedding"
+            " FROM user_facts WHERE user_id=?",
+            (str(user_id),),
         ).fetchall()
     finally:
         con.close()
-    return [dict(r) for r in rows]
+    items = [dict(r) for r in rows]
+    if not items:
+        return []
+    if query and query_vec is not None:
+        from .recall import rank_hybrid, split_recent_relevant
+        ranked = rank_hybrid(
+            items, query, query_vec, text_key="fact",
+            time_key="updated_at", vec_key="embedding")
+        strong = [r for r in ranked
+                  if _has_signal(r, query, query_vec, text_key="fact")]
+        return split_recent_relevant(
+            ranked, limit, time_key="updated_at", id_key="fact",
+            relevance=strong)
+    if query:
+        from .recall import rank_by_overlap, split_recent_relevant
+        ranked = rank_by_overlap(
+            items, query, text_key="fact", time_key="updated_at")
+        return split_recent_relevant(
+            ranked, limit, time_key="updated_at", id_key="fact",
+            relevance=ranked)
+    items.sort(key=lambda r: _num(r.get("updated_at")), reverse=True)
+    return items[:int(limit)]
 
 
 def get_fact_count(user_id=None):
@@ -530,6 +547,88 @@ def get_fact_count(user_id=None):
                 (str(user_id),),
             ).fetchone()
         return row["c"]
+    finally:
+        con.close()
+
+
+# ---------------- memory curation (prune old summaries/facts) ----------------
+
+def get_oldest_summaries(channel_id, limit):
+    """Oldest `limit` summaries for a channel (curation candidates)."""
+    con = _connect()
+    try:
+        rows = con.execute(
+            "SELECT chunk_id, summary, created_at FROM summaries"
+            " WHERE channel_id=? ORDER BY chunk_id ASC LIMIT ?",
+            (str(channel_id), int(limit)),
+        ).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+def delete_summaries(chunk_ids):
+    """Delete summaries by chunk_id. Returns rows deleted."""
+    ids = [int(c) for c in (chunk_ids or [])]
+    if not ids:
+        return 0
+    con = _connect()
+    try:
+        deleted = 0
+        for cid in ids:
+            cur = con.execute(
+                "DELETE FROM summaries WHERE chunk_id=?", (cid,))
+            deleted += cur.rowcount
+        con.commit()
+        return deleted
+    finally:
+        con.close()
+
+
+def get_users_over_fact_count(threshold):
+    """user_ids whose fact count exceeds `threshold`, oldest activity first."""
+    con = _connect()
+    try:
+        rows = con.execute(
+            """SELECT user_id, COUNT(*) AS c, MAX(updated_at) AS newest
+               FROM user_facts GROUP BY user_id HAVING c > ?
+               ORDER BY newest ASC""",
+            (int(threshold),),
+        ).fetchall()
+    finally:
+        con.close()
+    return [(r["user_id"], r["c"]) for r in rows]
+
+
+def get_oldest_facts(user_id, limit):
+    """Oldest `limit` facts for a user (curation candidates)."""
+    con = _connect()
+    try:
+        rows = con.execute(
+            "SELECT fact, updated_at FROM user_facts"
+            " WHERE user_id=? ORDER BY updated_at ASC LIMIT ?",
+            (str(user_id), int(limit)),
+        ).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+def delete_facts(user_id, facts):
+    """Delete specific facts for a user. Returns rows deleted."""
+    items = [f for f in (facts or []) if f]
+    if not items:
+        return 0
+    con = _connect()
+    try:
+        deleted = 0
+        for fact in items:
+            cur = con.execute(
+                "DELETE FROM user_facts WHERE user_id=? AND fact=?",
+                (str(user_id), str(fact)))
+            deleted += cur.rowcount
+        con.commit()
+        return deleted
     finally:
         con.close()
 

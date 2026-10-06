@@ -149,20 +149,23 @@ class StoreTest(TempDBMixin, unittest.TestCase):
         # legacy path (no query): recency order
         legacy = [f["fact"] for f in mem_store.get_facts("uq", 3)]
         self.assertEqual(legacy[0], "owns a farm")
-        # query path: topical old fact wins despite recency
+        # query path: when all facts fit the budget, rank order is intact
+        # (the recency floor only reorders once the pool exceeds limit)
         ranked = [f["fact"]
                   for f in mem_store.get_facts("uq", 3, query="minecraft?")]
         self.assertEqual(ranked[0], "plays minecraft daily")
 
-    def test_pool_reaches_beyond_20(self):
-        # oldest fact sits past the old 20-row pool cutoff: ranking must
-        # still surface it when topical (regression test for pool width)
+    def test_old_topical_fact_reaches_and_recent_kept(self):
+        # full-history scan surfaces an ancient strong match (past any
+        # legacy pool cutoff) while the newest rows keep the recency floor
         mem_store.upsert_fact("uw", "ancient pottery techniques")
         for i in range(24):
             mem_store.upsert_fact("uw", f"filler hobby number {i}")
         ranked = [f["fact"] for f in mem_store.get_facts(
             "uw", 3, query="pottery kiln")]
-        self.assertEqual(ranked[0], "ancient pottery techniques")
+        self.assertEqual(ranked[0], "filler hobby number 23")
+        self.assertEqual(ranked[1], "filler hobby number 22")
+        self.assertEqual(ranked[2], "ancient pottery techniques")
 
     def test_fact_embedding_roundtrip(self):
         import numpy as _np
@@ -237,6 +240,38 @@ class StoreTest(TempDBMixin, unittest.TestCase):
         self.assertEqual(mem_store.get_unsummarized("cd"), [])
         mem_store.add_message("cd", 30, "u1", "alice", "user", "thirtieth")
         self.assertEqual(len(mem_store.get_unsummarized("cd")), 30)
+
+    def test_curation_delete_and_counts(self):
+        mem_store.upsert_fact("ud", "a")
+        mem_store.upsert_fact("ud", "b")
+        mem_store.add_summary("cdel", "s1", 1, 5)
+        mem_store.add_summary("cdel", "s2", 6, 9)
+        self.assertEqual(mem_store.get_fact_count("ud"), 2)
+        self.assertEqual(mem_store.delete_facts("ud", ["a", "missing"]), 1)
+        self.assertEqual(mem_store.get_fact_count("ud"), 1)
+        oldest = mem_store.get_oldest_summaries("cdel", 2)
+        self.assertEqual([s["summary"] for s in oldest], ["s1", "s2"])
+        self.assertEqual(
+            mem_store.delete_summaries([oldest[0]["chunk_id"]]), 1)
+        self.assertEqual(mem_store.get_summary_count("cdel"), 1)
+
+    def test_users_over_fact_count(self):
+        for f in ("a", "b", "c"):
+            mem_store.upsert_fact("uo", f)
+        users = mem_store.get_users_over_fact_count(2)
+        self.assertIn(("uo", 3), users)
+        self.assertEqual(mem_store.get_users_over_fact_count(5), [])
+
+    def test_summary_recency_floor(self):
+        mem_store.add_summary("crf", "ancient pottery discussion", 1, 5)
+        mem_store.add_summary("crf", "random chatter", 6, 9)
+        mem_store.add_summary("crf", "more random", 10, 15)
+        found = [s["summary"] for s in mem_store.search_summaries(
+            "crf", "pottery")]
+        # newest always injects (recency floor)...
+        self.assertIn("more random", found)
+        # ...and the only topical match from the far past rides along
+        self.assertIn("ancient pottery discussion", found)
 
 
 class BufferTest(TempDBMixin, unittest.TestCase):
@@ -957,6 +992,54 @@ class RecallTest(TempDBMixin, unittest.TestCase):
         self.assertEqual(names["u7"], "nos_yous")
 
 
+class SelectionTest(unittest.TestCase):
+    def _facts(self):
+        # rank order (best first) deliberately favors the OLD fact
+        return [
+            {"fact": "old strong", "updated_at": 100.0},
+            {"fact": "mid", "updated_at": 200.0},
+            {"fact": "new1", "updated_at": 500.0},
+            {"fact": "new2", "updated_at": 400.0},
+            {"fact": "new3", "updated_at": 300.0},
+        ]
+
+    def test_recent_floor_and_relevant_fill(self):
+        out = mem_recall.split_recent_relevant(
+            self._facts(), 3, time_key="updated_at", id_key="fact")
+        facts = [r["fact"] for r in out]
+        # ceil(3/2)=2 newest first, then the top-ranked not already picked
+        self.assertEqual(facts, ["new1", "new2", "old strong"])
+
+    def test_dedup_backfills_when_newest_also_best(self):
+        rows = [
+            {"fact": "new", "updated_at": 500.0},
+            {"fact": "a", "updated_at": 100.0},
+            {"fact": "b", "updated_at": 90.0},
+        ]
+        out = mem_recall.split_recent_relevant(
+            rows, 2, time_key="updated_at", id_key="fact")
+        facts = [r["fact"] for r in out]
+        # "new" wins a recent slot; relevant slot must not duplicate it
+        self.assertEqual(facts[0], "new")
+        self.assertEqual(len(facts), 2)
+        self.assertEqual(facts[1], "a")
+
+    def test_limit_one_is_pure_recent(self):
+        out = mem_recall.split_recent_relevant(
+            self._facts(), 1, time_key="updated_at", id_key="fact")
+        self.assertEqual([r["fact"] for r in out], ["new1"])
+
+    def test_all_fit_preserves_rank_order(self):
+        out = mem_recall.split_recent_relevant(
+            self._facts(), 10, time_key="updated_at", id_key="fact")
+        self.assertEqual([r["fact"] for r in out][0], "old strong")
+
+    def test_empty_and_zero_limit(self):
+        self.assertEqual(mem_recall.split_recent_relevant([], 3), [])
+        self.assertEqual(
+            mem_recall.split_recent_relevant(self._facts(), 0), [])
+
+
 class FactsTest(unittest.TestCase):
     def test_parse_single_user(self):
         self.assertEqual(
@@ -1047,6 +1130,46 @@ class SummaryPromptTest(unittest.TestCase):
         p = mem_summary.build_multi_fact_prompt(msgs, max_chars=40)
         self.assertNotIn("w" * 100, p)
         self.assertIn("w" * 40, p)
+
+    def test_curate_facts_prompt_numbering_and_truncation(self):
+        rows = [
+            {"fact": "x" * 300, "updated_at": 0},
+            {"fact": "likes osu", "updated_at": 0},
+        ]
+        p = mem_summary.build_curate_facts_prompt(rows, max_chars=100)
+        self.assertIn("1. ", p)
+        self.assertIn("2. likes osu", p)
+        self.assertNotIn("x" * 300, p)
+        self.assertIn("x" * 100, p)
+
+    def test_curate_summaries_prompt_numbering(self):
+        rows = [{"summary": "nothing happened", "created_at": 0}]
+        p = mem_summary.build_curate_summaries_prompt(rows)
+        self.assertIn("1. nothing happened", p)
+
+    def test_parse_curate_indices(self):
+        self.assertEqual(
+            mem_summary.parse_curate_indices('{"delete":[1,3]}', 4), [0, 2])
+        self.assertEqual(mem_summary.parse_curate_indices("[2]", 4), [1])
+        self.assertEqual(
+            mem_summary.parse_curate_indices('{"remove":[4]}', 4), [3])
+        # out-of-range, duplicates, non-integers, and bools are dropped
+        self.assertEqual(
+            mem_summary.parse_curate_indices('[0,5,2,2,"x",true]', 4), [1])
+        self.assertEqual(mem_summary.parse_curate_indices("nope", 4), [])
+        self.assertEqual(
+            mem_summary.parse_curate_indices('{"delete":[]}', 4), [])
+        self.assertEqual(
+            mem_summary.parse_curate_indices('{"delete":[1]}', 0), [])
+
+    def test_age_str(self):
+        now = 1_000_000.0
+        self.assertEqual(mem_summary._age_str(now - 90, now), "1m ago")
+        self.assertEqual(mem_summary._age_str(now - 7200, now), "2h ago")
+        self.assertEqual(mem_summary._age_str(now - 3 * 86400, now),
+                         "3d ago")
+        self.assertEqual(mem_summary._age_str(0, now), "")
+        self.assertEqual(mem_summary._age_str("bad", now), "")
 
 
 class ExamplesTest(unittest.TestCase):

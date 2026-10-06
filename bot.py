@@ -94,10 +94,15 @@ def apply_config(cfg, initial=False):
     global MAX_OLLAMA_TOKENS, BUFFER_MERGE_GAP_SECONDS
     global MEMORY_BUFFER_MAX_MSGS, MEMORY_BUFFER_TOKENS
     global MEMORY_DB_PATH, MEMORY_ENGAGE_LOOKBACK, MEMORY_FACTS_ENABLED
+    global MEMORY_FACT_LIMIT
+    global MEMORY_CURATE_ENABLED, MEMORY_CURATE_DRY_RUN
+    global MEMORY_CURATE_KEEP_FACTS, MEMORY_CURATE_BATCH_FACTS
+    global MEMORY_CURATE_KEEP_SUMMARIES, MEMORY_CURATE_BATCH_SUMMARIES
     global MEMORY_PEER_MAX_FACTS, MEMORY_PEER_MAX_USERS, MEMORY_PRUNE_KEEP
     global MEMORY_RECALL_ENABLED, MEMORY_RECALL_LIMIT, MEMORY_SEMANTIC_RANK
     global MEMORY_SUMMARY_CHUNK, MEMORY_SUMMARY_CHUNK_TOKENS
     global MEMORY_SUMMARY_MIN_MSGS, MODEL, OLLAMA_AUTOLOAD, OLLAMA_BASE
+    global MEMORY_SUMMARY_LIMIT
     global OLLAMA_MODEL, OLLAMA_TIMEOUT, OLLAMA_URL, OPENROUTER_API_KEY
     global OPENROUTER_HEADERS, OPENROUTER_NO_CACHE
     global PROMPT_COMMAND_DESCRIPTION, PROMPT_COMMAND_NAME
@@ -171,12 +176,23 @@ def apply_config(cfg, initial=False):
     MEMORY_ENGAGE_LOOKBACK = cfg.get("memory_engage_lookback", 30)
     MEMORY_SUMMARY_CHUNK_TOKENS = cfg.get("memory_summary_chunk_tokens", 3000)
     MEMORY_SUMMARY_MIN_MSGS = cfg.get("memory_summary_min_msgs", 10)
+    MEMORY_SUMMARY_LIMIT = cfg.get("memory_summary_limit", 2)
     MEMORY_FACTS_ENABLED = cfg.get("memory_facts_enabled", True)
+    MEMORY_FACT_LIMIT = cfg.get("memory_fact_limit", 5)
     MEMORY_RECALL_ENABLED = cfg.get("memory_recall_enabled", True)
     MEMORY_RECALL_LIMIT = cfg.get("memory_recall_limit", 3)
     MEMORY_SEMANTIC_RANK = cfg.get("memory_semantic_rank", True)
     MEMORY_PEER_MAX_USERS = cfg.get("memory_peer_max_users", 2)
     MEMORY_PEER_MAX_FACTS = cfg.get("memory_peer_max_facts", 3)
+    # Background curation of old facts/summaries (keeps retrieval bounded
+    # without losing recent data). keep_* newest rows are never judged;
+    # a run fires only when count > keep + batch and deletes one batch.
+    MEMORY_CURATE_ENABLED = cfg.get("memory_curate_enabled", True)
+    MEMORY_CURATE_DRY_RUN = cfg.get("memory_curate_dry_run", False)
+    MEMORY_CURATE_KEEP_FACTS = cfg.get("memory_curate_keep_facts", 50)
+    MEMORY_CURATE_BATCH_FACTS = cfg.get("memory_curate_batch_facts", 50)
+    MEMORY_CURATE_KEEP_SUMMARIES = cfg.get("memory_curate_keep_summaries", 100)
+    MEMORY_CURATE_BATCH_SUMMARIES = cfg.get("memory_curate_batch_summaries", 100)
     # Replied-to context replacing keyword recall for out-of-window parents:
     # how many preceding messages to include, and parent truncation budget.
     REPLY_CONTEXT_BEFORE = cfg.get("reply_context_before", 3)
@@ -905,14 +921,16 @@ async def get_memory_context(channel_id, user_message, author_id="",
     try:
         summaries, recalled, facts, recent = await asyncio.gather(
             asyncio.to_thread(
-                mem_store.search_summaries, channel_id, user_message, 2,
+                mem_store.search_summaries, channel_id, user_message,
+                MEMORY_SUMMARY_LIMIT,
                 query_vec),
             asyncio.to_thread(
                 mem_recall.search_messages, channel_id, user_message,
                 MEMORY_RECALL_LIMIT, exclude_ids) if MEMORY_RECALL_ENABLED
             else asyncio.sleep(0, result=[]),
             asyncio.to_thread(
-                mem_store.get_facts, author_id, 5, user_message, query_vec)
+                mem_store.get_facts, author_id, MEMORY_FACT_LIMIT,
+                user_message, query_vec)
             if (MEMORY_FACTS_ENABLED and author_id) else asyncio.sleep(0, result=[]),
             asyncio.to_thread(
                 mem_store.get_recent, channel_id, 15)
@@ -2590,6 +2608,87 @@ async def backfill_embeddings(limit=5):
         log.exception("[memory] embedding backfill failed")
 
 
+async def curate_channel_summaries(channel_id):
+    """Model-curate the oldest summaries of one channel (fail-soft).
+
+    Fires only when the channel's summary count exceeds keep + batch;
+    judges at most one batch of the oldest rows (newest are exempt) and
+    deletes only what the model flags. Dry-run logs without deleting.
+    """
+    if not MEMORY_CURATE_ENABLED:
+        return
+    keep = MEMORY_CURATE_KEEP_SUMMARIES
+    batch = MEMORY_CURATE_BATCH_SUMMARIES
+    total = await asyncio.to_thread(mem_store.get_summary_count, channel_id)
+    if total <= keep + batch:
+        return
+    rows = await asyncio.to_thread(
+        mem_store.get_oldest_summaries, channel_id, min(batch, total - keep))
+    if not rows:
+        return
+    try:
+        prompt = mem_summary.build_curate_summaries_prompt(rows)
+        raw = await summary_generate([
+            {"role": "system",
+             "content": mem_summary.CURATION_SUMMARIES_SYSTEM},
+            {"role": "user", "content": prompt},
+        ], purpose="curate")
+    except Exception:
+        log.exception("[curate] summary judgment failed for %s", channel_id)
+        return
+    drop = mem_summary.parse_curate_indices(raw, len(rows))
+    if not drop:
+        return
+    ids = [rows[i]["chunk_id"] for i in drop]
+    if MEMORY_CURATE_DRY_RUN:
+        log.info("[curate] dry-run %s: would delete %d/%d summaries %s",
+                 channel_id, len(ids), total, ids)
+        return
+    deleted = await asyncio.to_thread(mem_store.delete_summaries, ids)
+    log.info("[curate] deleted %d/%d summaries in %s",
+             deleted, total, channel_id)
+
+
+async def curate_facts():
+    """Model-curate stale facts across all users (fail-soft, bounded)."""
+    if not MEMORY_CURATE_ENABLED:
+        return
+    keep = MEMORY_CURATE_KEEP_FACTS
+    batch = MEMORY_CURATE_BATCH_FACTS
+    try:
+        users = await asyncio.to_thread(
+            mem_store.get_users_over_fact_count, keep + batch)
+    except Exception:
+        log.exception("[curate] fact count query failed")
+        return
+    for uid, total in users:
+        rows = await asyncio.to_thread(
+            mem_store.get_oldest_facts, uid, min(batch, total - keep))
+        if not rows:
+            continue
+        try:
+            prompt = mem_summary.build_curate_facts_prompt(rows)
+            raw = await summary_generate([
+                {"role": "system",
+                 "content": mem_summary.CURATION_FACTS_SYSTEM},
+                {"role": "user", "content": prompt},
+            ], purpose="curate")
+        except Exception:
+            log.exception("[curate] fact judgment failed for %s", uid)
+            continue
+        idx = mem_summary.parse_curate_indices(raw, len(rows))
+        if not idx:
+            continue
+        facts = [rows[i]["fact"] for i in idx]
+        if MEMORY_CURATE_DRY_RUN:
+            log.info("[curate] dry-run: would delete %d/%d facts for %s: %s",
+                     len(facts), total, uid, facts)
+            continue
+        deleted = await asyncio.to_thread(mem_store.delete_facts, uid, facts)
+        log.info("[curate] deleted %d/%d facts for %s", deleted, total, uid)
+        await asyncio.sleep(1)  # don't hammer the model across many users
+
+
 async def memory_maintenance_loop():
     """Periodically summarize channels seen recently. Fail-soft."""
     await client.wait_until_ready()
@@ -2598,6 +2697,9 @@ async def memory_maintenance_loop():
             bot_id = str(client.user.id) if client.user else ""
             if MEMORY_SEMANTIC_RANK:
                 await backfill_embeddings()
+            # Curation is global for facts (they aren't channel-scoped).
+            if MEMORY_CURATE_ENABLED:
+                await curate_facts()
             # discover channels from recent guilds to avoid unbounded growth
             for guild in client.guilds:
                 for ch in guild.text_channels:
@@ -2617,12 +2719,14 @@ async def memory_maintenance_loop():
                     if chunk:
                         await summarize_channel(ch.id)
                         await asyncio.sleep(2)  # don't hammer the LLM
+                    await curate_channel_summaries(ch.id)
             # also cover DM channels the bot has seen (_track_channel.seen
             # is populated by on_message; a local set here would stay empty)
             for channel_id in list(getattr(_track_channel, "seen", ())):
                 if not await is_channel_engaged(channel_id, bot_id):
                     continue
                 await summarize_channel(channel_id)
+                await curate_channel_summaries(channel_id)
         except Exception:
             log.exception("[memory] maintenance loop error")
         await asyncio.sleep(SUMMARY_INTERVAL)

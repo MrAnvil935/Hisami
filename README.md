@@ -182,15 +182,30 @@ prompt:
   until mentioned again (DMs always qualify and are summarized like
   any channel).
 * **Per-user facts** — durable traits extracted for all speakers batched
-  on each summary chunk, embedded at write time. At prompt time facts rank
-  by embedding similarity + keyword boost (recency tiebreak), so a topical
-  old fact beats newer trivial ones; top 5 per user are injected. Disable
-  with `memory_semantic_rank: false` for pure keyword ranking (also the
-  automatic fallback when Ollama is down).
+  on each summary chunk, embedded at write time. At prompt time the whole
+  (curated) fact set is ranked by embedding similarity + keyword boost,
+  then the budget is split: the newest `ceil(limit/2)` facts always inject
+  (recency floor) and the rest come from the top-ranked matches — so an
+  old topical fact can surface without letting the bot forget what was
+  said most recently. The author's `memory_fact_limit` (default 5) inject.
+  Disable ranking with `memory_semantic_rank: false` for pure keyword
+  (also the automatic fallback when Ollama is down).
 * **Peer recall** — when someone mentions, names, or chats alongside other
   users, their facts are injected too (`Known about <name>:`), so the bot
-  can answer *about* people, not just *to* the author. Name matching is
+  can answer *about* people, not just *to* the author (up to
+  `memory_peer_max_users` users × `memory_peer_max_facts` facts each,
+  same recency floor). Name matching is
   whole-word and nickname-tolerant (`nos` matches speaker `nos_yous`).
+* **Memory curation** — a background pass keeps the full-scan retrieval
+  bounded without recency amnesia: when a table grows past `keep + batch`
+  (facts `memory_curate_keep_facts`/`_batch_facts`, summaries
+  `memory_curate_keep_summaries`/`_batch_summaries`), the summary model
+  judges one batch of the *oldest* rows (newest keep_* are exempt) and
+  deletes only clearly stale/superseded facts or redundant/empty
+  summaries — "when in doubt, keep". Runs on the local-first summary
+  chain (`purpose="curate"` in `llm.jsonl`), never the live model;
+  `memory_curate_enabled` off or `memory_curate_dry_run` logs without
+  deleting. Fail-soft: offline just leaves tables growing until next run.
 * **Image understanding** — the first image in a ping (upload, link, or
   replied-to message) is downscaled to 512px and described by a separate
   local-first vision chain; descriptions are cached by source URL. The
@@ -249,8 +264,9 @@ The `system` message holds, in order:
    `examples_max_tokens`, the only size limit), keeping each example's
    full Context / User Input / Target Response body and explicitly
    framed as tone references that must never be answered
-4. `Reference memory:` summaries, recalled messages or the reply-context
-   block, and author/peer facts
+4. `Reference memory:` up to `memory_summary_limit` (default 2, newest
+   half guaranteed) channel summaries, recalled messages or the
+   reply-context block, and author/peer facts
 5. Web results (if a search trigger fired)
 6. A closing line telling the model the above is background context and
    that any `[Attached image …]` note in the final user turn is the
@@ -283,7 +299,8 @@ Terminal output stays at INFO (one line per model call). Full detail goes to
   (`PROMPT SENT TO MODEL … [END PROMPT]`) and per-section token estimates.
 * `logs/llm.jsonl` — one pretty-printed JSON object per LLM call with full
   request/response bodies, purpose tag (`chat`, `prompt`, `summary`,
-  `facts`, `vision`), latency and status. Never contains HTTP headers
+  `facts`, `vision`, `curate`), latency and status. Never contains HTTP
+  headers
   (no API keys); image bytes are logged as size placeholders, not blobs.
   Rotated with `.1`, `.2` backups.
 
@@ -331,7 +348,7 @@ memory/            Persistent memory package (SQLite + retrieval helpers)
   store.py         Schema, message/summary/fact/image-cache persistence (WAL + FTS5)
   buffer.py        Token-aware short-term window
   recall.py        Keyword recall, peer-user detection, fact ranking
-  summary.py       Summarizer and fact-extraction prompt builders
+  summary.py       Summarizer, fact-extraction and curation prompt builders
   web.py           Web-result rendering for Components V2
   facts.py         Fact JSON parsing + speaker resolution
   examples.py      Style-example compaction + token budgeting

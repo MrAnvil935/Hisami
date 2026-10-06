@@ -58,9 +58,14 @@
   "memory_summary_chunk_tokens": 3000,
   // ...but never summarize fewer than this many messages at once.
   "memory_summary_min_msgs": 10,
+  // Conversation summaries injected per reply (newest half guaranteed,
+  // rest relevance-ranked; 0 disables summaries).
+  "memory_summary_limit": 2,
   // Master switch for per-user fact extraction (live mention path excluded;
   // batched chunk extraction only). Facts of the author + peers inject.
   "memory_facts_enabled": true,
+  // Author facts injected per reply (ranked; 0 disables author facts).
+  "memory_fact_limit": 5,
   // Master switch for FTS5 keyword recall over past messages.
   "memory_recall_enabled": true,
   // Past messages injected per reply (keyword-ranked).
@@ -72,6 +77,22 @@
   "memory_peer_max_users": 2,
   // ...with at most this many facts each.
   "memory_peer_max_facts": 3,
+  // Background curation: periodically ask the summary model to delete
+  // stale/superseded facts and redundant/empty summaries, keeping retrieval
+  // bounded without recency amnesia. Newest keep_* rows are never judged.
+  // Fires only when a table exceeds keep + batch; deletes at most one batch.
+  "memory_curate_enabled": true,
+  // true = log what would be deleted but delete nothing (trust-building).
+  "memory_curate_dry_run": false,
+  // Newest N facts per user exempt from judgment.
+  "memory_curate_keep_facts": 50,
+  // How many of a user's oldest facts (beyond keep_facts) are judged per run.
+  "memory_curate_batch_facts": 50,
+  // Newest N summaries per channel exempt from judgment.
+  "memory_curate_keep_summaries": 100,
+  // How many of a channel's oldest summaries (beyond keep_summaries) are
+  // judged per run.
+  "memory_curate_batch_summaries": 100,
   // Reply-pings: preceding messages pulled with an out-of-window parent,
   // and max chars of the parent itself in the replacement block.
   "reply_context_before": 3,

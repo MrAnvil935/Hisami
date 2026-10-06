@@ -4,6 +4,7 @@ No new dependencies. FTS5 query is built from sanitized alphanumeric
 tokens so user input can never break the MATCH syntax.
 """
 
+import math
 import re
 import sqlite3
 
@@ -127,6 +128,73 @@ def rank_hybrid(items, query, query_vec=None, text_key="fact",
     scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
     # all-zero scores collapse to pure recency (legacy order)
     return [s[2] for s in scored]
+
+
+def split_recent_relevant(items, limit, time_key="updated_at", id_key=None,
+                          share=0.5, relevance=None):
+    """Guarantee a recency floor, then fill the rest by relevance rank.
+
+    `items` is the full candidate pool (all rows). The newest
+    ceil(limit * share) items always make the cut, so recent memory can
+    never be fully displaced by an old strong match. The remaining slots
+    come from `relevance` (defaults to `items`) in the order given
+    (best first), skipping anything already picked. If relevance runs
+    out, the slots backfill from next-most-recent in `items`, keeping
+    the recent floor a floor. Output is recent picks first, then
+    relevance picks. Dedup is by `id_key` when given (fact text /
+    summary chunk_id), else by object identity. Returns a new list;
+    input order is untouched. Pure function.
+    """
+    items = list(items or [])
+    rel_pool = list(relevance) if relevance is not None else items
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0 or not items:
+        return []
+    if limit >= len(items):
+        return items[:limit]
+
+    def _key(item):
+        if id_key:
+            return item.get(id_key)
+        return id(item)
+
+    def _ts(item):
+        try:
+            return float(item.get(time_key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    recent_quota = min(limit, max(1, math.ceil(limit * share)))
+    recent_sorted = sorted(items, key=_ts, reverse=True)
+    recent = recent_sorted[:recent_quota]
+    picked = {_key(it) for it in recent}
+
+    relevant = []
+    for item in rel_pool:  # already best-first
+        if len(relevant) >= limit - len(recent):
+            break
+        k = _key(item)
+        if k in picked:
+            continue
+        relevant.append(item)
+        picked.add(k)
+
+    # Backfill any unfilled slots from next-most-recent (relevance found
+    # nothing more than the guarantee), keeping the recent floor a floor.
+    if len(recent) + len(relevant) < limit:
+        for item in recent_sorted:
+            if len(recent) + len(relevant) >= limit:
+                break
+            k = _key(item)
+            if k in picked:
+                continue
+            relevant.append(item)
+            picked.add(k)
+
+    return recent + relevant
 
 
 def search_messages(channel_id, query, limit=5, exclude_ids=None):
