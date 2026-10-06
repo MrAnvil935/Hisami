@@ -99,6 +99,8 @@ def apply_config(cfg, initial=False):
     global MEMORY_CURATE_KEEP_FACTS, MEMORY_CURATE_BATCH_FACTS
     global MEMORY_CURATE_KEEP_SUMMARIES, MEMORY_CURATE_BATCH_SUMMARIES
     global CURATE_MAX_TOKENS
+    global MEMORY_CURATE_COOLDOWN, MEMORY_CURATE_MAX_FACTS
+    global MEMORY_CURATE_MAX_SUMMARIES
     global MEMORY_PEER_MAX_FACTS, MEMORY_PEER_MAX_USERS, MEMORY_PRUNE_KEEP
     global MEMORY_RECALL_ENABLED, MEMORY_RECALL_LIMIT, MEMORY_SEMANTIC_RANK
     global MEMORY_SUMMARY_CHUNK, MEMORY_SUMMARY_CHUNK_TOKENS
@@ -197,6 +199,13 @@ def apply_config(cfg, initial=False):
     # Curation emits a JSON index list over a whole batch, so it needs a
     # larger output cap than a short conversation summary.
     CURATE_MAX_TOKENS = cfg.get("curate_max_tokens", 4000)
+    # Don't re-run curation more often than this (per channel for summaries,
+    # globally for facts) so the loop can't spam near-useless model calls.
+    MEMORY_CURATE_COOLDOWN = cfg.get("memory_curate_cooldown_seconds", 3600)
+    # Hard caps: once a table exceeds one, the model is told to remove at
+    # least the excess regardless of value. 0 disables the cap.
+    MEMORY_CURATE_MAX_FACTS = cfg.get("memory_curate_max_facts", 150)
+    MEMORY_CURATE_MAX_SUMMARIES = cfg.get("memory_curate_max_summaries", 300)
     # Replied-to context replacing keyword recall for out-of-window parents:
     # how many preceding messages to include, and parent truncation budget.
     REPLY_CONTEXT_BEFORE = cfg.get("reply_context_before", 3)
@@ -2615,14 +2624,23 @@ async def backfill_embeddings(limit=5):
         log.exception("[memory] embedding backfill failed")
 
 
+_CURATE_STATE = {"facts": 0.0, "channels": {}}
+
+
 async def curate_channel_summaries(channel_id):
     """Model-curate the oldest summaries of one channel (fail-soft).
 
-    Fires only when the channel's summary count exceeds keep + batch;
-    judges at most one batch of the oldest rows (newest are exempt) and
-    deletes only what the model flags. Dry-run logs without deleting.
+    Fires only when the channel's summary count exceeds keep + batch and
+    the per-channel cooldown has elapsed; judges at most one batch of the
+    oldest rows (newest are exempt). Over the hard cap, the model is told
+    to delete at least the excess and the shortfall is enforced from the
+    oldest rows. Dry-run logs without deleting.
     """
     if not MEMORY_CURATE_ENABLED:
+        return
+    now = time.time()
+    last = _CURATE_STATE["channels"].get(channel_id, 0.0)
+    if now - last < MEMORY_CURATE_COOLDOWN:
         return
     keep = MEMORY_CURATE_KEEP_SUMMARIES
     batch = MEMORY_CURATE_BATCH_SUMMARIES
@@ -2633,8 +2651,12 @@ async def curate_channel_summaries(channel_id):
         mem_store.get_oldest_summaries, channel_id, min(batch, total - keep))
     if not rows:
         return
+    min_delete = mem_summary.curate_min_delete(
+        total, MEMORY_CURATE_MAX_SUMMARIES, len(rows))
+    _CURATE_STATE["channels"][channel_id] = now
     try:
-        prompt = mem_summary.build_curate_summaries_prompt(rows)
+        prompt = mem_summary.build_curate_summaries_prompt(
+            rows, min_delete=min_delete)
         raw = await summary_generate([
             {"role": "system",
              "content": mem_summary.CURATION_SUMMARIES_SYSTEM},
@@ -2644,12 +2666,14 @@ async def curate_channel_summaries(channel_id):
         log.exception("[curate] summary judgment failed for %s", channel_id)
         return
     drop = mem_summary.parse_curate_indices(raw, len(rows))
+    drop = mem_summary.ensure_min_deletions(drop, len(rows), min_delete)
     if not drop:
         return
     ids = [rows[i]["chunk_id"] for i in drop]
     if MEMORY_CURATE_DRY_RUN:
-        log.info("[curate] dry-run %s: would delete %d/%d summaries %s",
-                 channel_id, len(ids), total, ids)
+        log.info("[curate] dry-run %s: would delete %d/%d summaries "
+                 "(min=%d) %s",
+                 channel_id, len(ids), total, min_delete, ids)
         return
     deleted = await asyncio.to_thread(mem_store.delete_summaries, ids)
     log.info("[curate] deleted %d/%d summaries in %s",
@@ -2657,8 +2681,16 @@ async def curate_channel_summaries(channel_id):
 
 
 async def curate_facts():
-    """Model-curate stale facts across all users (fail-soft, bounded)."""
+    """Model-curate stale facts across all users (fail-soft, bounded).
+
+    Gated by a global cooldown. Over the hard cap, the model is told to
+    delete at least the excess and the shortfall is enforced from the
+    oldest facts.
+    """
     if not MEMORY_CURATE_ENABLED:
+        return
+    now = time.time()
+    if now - _CURATE_STATE["facts"] < MEMORY_CURATE_COOLDOWN:
         return
     keep = MEMORY_CURATE_KEEP_FACTS
     batch = MEMORY_CURATE_BATCH_FACTS
@@ -2668,13 +2700,19 @@ async def curate_facts():
     except Exception:
         log.exception("[curate] fact count query failed")
         return
+    if not users:
+        return
+    _CURATE_STATE["facts"] = now
     for uid, total in users:
         rows = await asyncio.to_thread(
             mem_store.get_oldest_facts, uid, min(batch, total - keep))
         if not rows:
             continue
+        min_delete = mem_summary.curate_min_delete(
+            total, MEMORY_CURATE_MAX_FACTS, len(rows))
         try:
-            prompt = mem_summary.build_curate_facts_prompt(rows)
+            prompt = mem_summary.build_curate_facts_prompt(
+                rows, min_delete=min_delete)
             raw = await summary_generate([
                 {"role": "system",
                  "content": mem_summary.CURATION_FACTS_SYSTEM},
@@ -2684,12 +2722,14 @@ async def curate_facts():
             log.exception("[curate] fact judgment failed for %s", uid)
             continue
         idx = mem_summary.parse_curate_indices(raw, len(rows))
+        idx = mem_summary.ensure_min_deletions(idx, len(rows), min_delete)
         if not idx:
             continue
         facts = [rows[i]["fact"] for i in idx]
         if MEMORY_CURATE_DRY_RUN:
-            log.info("[curate] dry-run: would delete %d/%d facts for %s: %s",
-                     len(facts), total, uid, facts)
+            log.info("[curate] dry-run: would delete %d/%d facts for %s "
+                     "(min=%d): %s",
+                     len(facts), total, uid, min_delete, facts)
             continue
         deleted = await asyncio.to_thread(mem_store.delete_facts, uid, facts)
         log.info("[curate] deleted %d/%d facts for %s", deleted, total, uid)

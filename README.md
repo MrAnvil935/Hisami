@@ -203,7 +203,13 @@ prompt:
   `memory_curate_keep_summaries`/`_batch_summaries`), the summary model
   judges one batch of the *oldest* rows (newest keep_* are exempt) and
   deletes only clearly stale/superseded facts or redundant/empty
-  summaries — "when in doubt, keep". Runs on the local-first summary
+  summaries — "when in doubt, keep". Passes are throttled by
+  `memory_curate_cooldown_seconds` (default 3600; per channel for
+  summaries, global for facts) so the loop can't spam near-useless calls.
+  Hard caps `memory_curate_max_facts` (150) and `memory_curate_max_summaries`
+  (300) force a floor: above the cap the model is told to delete at least
+  the excess "even if all seem worth keeping", and any shortfall is
+  enforced from the oldest rows. Runs on the local-first summary
   chain (`purpose="curate"` in `llm.jsonl`) with its own output cap
   `curate_max_tokens` (default 4000, since it returns a whole batch's
   index list), never the live model;

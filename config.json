@@ -84,15 +84,24 @@
   "memory_curate_enabled": true,
   // true = log what would be deleted but delete nothing (trust-building).
   "memory_curate_dry_run": false,
+  // Minimum seconds between curation passes (per channel for summaries,
+  // global for facts) so the loop can't spam near-useless model calls.
+  "memory_curate_cooldown_seconds": 3600,
   // Newest N facts per user exempt from judgment.
   "memory_curate_keep_facts": 50,
   // How many of a user's oldest facts (beyond keep_facts) are judged per run.
   "memory_curate_batch_facts": 50,
+  // Hard cap: above this many facts a user's table is over-limit, so the
+  // model must delete at least the excess regardless of value. 0 disables.
+  "memory_curate_max_facts": 150,
   // Newest N summaries per channel exempt from judgment.
   "memory_curate_keep_summaries": 100,
   // How many of a channel's oldest summaries (beyond keep_summaries) are
   // judged per run.
   "memory_curate_batch_summaries": 100,
+  // Hard cap: above this many summaries a channel is over-limit and the
+  // model must delete at least the excess regardless of value. 0 disables.
+  "memory_curate_max_summaries": 300,
   // Reply-pings: preceding messages pulled with an out-of-window parent,
   // and max chars of the parent itself in the replacement block.
   "reply_context_before": 3,

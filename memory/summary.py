@@ -90,12 +90,14 @@ def _age_str(timestamp, now=None):
     return f"{secs // 86400}d ago"
 
 
-def build_curate_facts_prompt(rows, max_chars=200, now=None):
+def build_curate_facts_prompt(rows, max_chars=200, now=None, min_delete=0):
     """Prompt the curated deletion of stale user facts.
 
     `rows` are dicts with 'fact' and 'updated_at'. Numbered from 1 so the
     model can only reference an index (never echo text back). Expects a
-    JSON object {"delete": [1-based indices]}.
+    JSON object {"delete": [1-based indices]}. min_delete > 0 signals the
+    table is over its hard cap, turning the judgment into a requirement
+    (the caller enforces it even if the model under-delivers).
     """
     lines = []
     for i, r in enumerate(rows, 1):
@@ -104,20 +106,29 @@ def build_curate_facts_prompt(rows, max_chars=200, now=None):
         suffix = f" ({age})" if age else ""
         lines.append(f"{i}. {fact}{suffix}")
     body = "\n".join(lines)
+    forced = ""
+    if min_delete > 0:
+        forced = (
+            f" The database is over its limit: you MUST delete at least "
+            f"{min_delete} of these entries, choosing the least valuable "
+            f"ones, even if all of them seem worth keeping.")
     return (
         "Below are durable facts about one user, numbered. Identify any "
-        "that are stale, superseded, duplicated, or worthless trivia. "
+        "that are stale, superseded, duplicated, or worthless trivia."
+        f"{forced} "
         'Reply with ONLY JSON: {"delete": [numbers]}. Use [] to delete '
         "nothing. Never include fact text.\n\n"
         f"{body}"
     )
 
 
-def build_curate_summaries_prompt(rows, max_chars=400, now=None):
+def build_curate_summaries_prompt(rows, max_chars=400, now=None,
+                                  min_delete=0):
     """Prompt the curated deletion of redundant/empty summaries.
 
     `rows` are dicts with 'summary' and 'created_at'. Numbered from 1;
-    expects {"delete": [1-based indices]}.
+    expects {"delete": [1-based indices]}. min_delete > 0 signals the
+    table is over its hard cap and turns the judgment into a requirement.
     """
     lines = []
     for i, r in enumerate(rows, 1):
@@ -126,10 +137,18 @@ def build_curate_summaries_prompt(rows, max_chars=400, now=None):
         suffix = f" ({age})" if age else ""
         lines.append(f"{i}. {text}{suffix}")
     body = "\n".join(lines)
+    forced = ""
+    if min_delete > 0:
+        forced = (
+            f" The archive is over its limit: you MUST delete at least "
+            f"{min_delete} of these entries, choosing the least valuable "
+            f"ones, even if all of them seem worth keeping.")
     return (
         "Below are conversation summaries, numbered oldest first. Identify "
         "only those that are redundant with another entry or contain no "
-        'durable information. Reply with ONLY JSON: {"delete": [numbers]}. '
+        "durable information."
+        f"{forced} "
+        'Reply with ONLY JSON: {"delete": [numbers]}. '
         "Use [] to delete nothing. Never include summary text.\n\n"
         f"{body}"
     )
@@ -177,3 +196,44 @@ def parse_curate_indices(text, count):
         if 1 <= n <= count:
             out.add(n - 1)
     return sorted(out)
+
+
+def curate_min_delete(total, cap, batch_room):
+    """Forced-deletion count when a table is over its hard cap.
+
+    Returns the excess (total - cap) bounded by how many rows are actually
+    up for judgment (batch_room); 0 when under cap or the cap is disabled.
+    Pure function.
+    """
+    try:
+        total, cap, batch_room = int(total), int(cap), int(batch_room)
+    except (TypeError, ValueError):
+        return 0
+    if cap <= 0 or total <= cap:
+        return 0
+    return max(0, min(total - cap, batch_room))
+
+
+def ensure_min_deletions(indices, count, min_delete):
+    """Raise a curation index set to at least `min_delete` removals.
+
+    Used when a table is over its hard cap: the model's judgment is kept,
+    but if it under-delivers we fill the shortfall from the oldest rows
+    (lowest indices) so the cap is actually enforced. Returns sorted
+    0-based indices; never exceeds `count`. Pure function.
+    """
+    try:
+        count = int(count)
+        min_delete = int(min_delete)
+    except (TypeError, ValueError):
+        return sorted(set(indices or ()))
+    if count <= 0:
+        return []
+    picked = {i for i in (indices or ()) if isinstance(i, int)
+              and 0 <= i < count}
+    target = max(0, min(min_delete, count))
+    i = 0
+    while len(picked) < target and i < count:
+        picked.add(i)
+        i += 1
+    return sorted(picked)

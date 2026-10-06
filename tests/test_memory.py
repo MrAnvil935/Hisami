@@ -1171,6 +1171,42 @@ class SummaryPromptTest(unittest.TestCase):
         self.assertEqual(mem_summary._age_str(0, now), "")
         self.assertEqual(mem_summary._age_str("bad", now), "")
 
+    def test_curate_min_delete(self):
+        # over cap -> excess, bounded by rows up for judgment
+        self.assertEqual(mem_summary.curate_min_delete(350, 300, 100), 50)
+        self.assertEqual(mem_summary.curate_min_delete(500, 300, 100), 100)
+        # at/under cap or disabled cap -> 0
+        self.assertEqual(mem_summary.curate_min_delete(300, 300, 100), 0)
+        self.assertEqual(mem_summary.curate_min_delete(100, 0, 100), 0)
+        self.assertEqual(mem_summary.curate_min_delete("x", 300, 100), 0)
+
+    def test_ensure_min_deletions(self):
+        # model under-delivered -> fill from oldest rows to reach minimum
+        self.assertEqual(mem_summary.ensure_min_deletions([5], 10, 3),
+                         [0, 1, 5])
+        # model delivered enough -> untouched
+        self.assertEqual(mem_summary.ensure_min_deletions([2, 4, 6], 10, 3),
+                         [2, 4, 6])
+        # no forced minimum -> keep model's picks only
+        self.assertEqual(mem_summary.ensure_min_deletions([], 10, 0), [])
+        # target clamped to available rows
+        self.assertEqual(mem_summary.ensure_min_deletions([], 2, 5), [0, 1])
+        self.assertEqual(mem_summary.ensure_min_deletions([99], 3, 0), [])
+
+    def test_curate_prompts_forced_minimum(self):
+        rows = [{"fact": "f", "updated_at": 0},
+                {"summary": "s", "created_at": 0}]
+        self.assertIn(
+            "at least 4",
+            mem_summary.build_curate_facts_prompt(rows, min_delete=4))
+        self.assertIn(
+            "at least 7",
+            mem_summary.build_curate_summaries_prompt(rows, min_delete=7))
+        # no forced text when under cap
+        self.assertNotIn(
+            "MUST delete",
+            mem_summary.build_curate_facts_prompt(rows))
+
 
 class ExamplesTest(unittest.TestCase):
     def test_strip_boilerplate(self):
