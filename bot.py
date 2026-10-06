@@ -98,6 +98,7 @@ def apply_config(cfg, initial=False):
     global MEMORY_CURATE_ENABLED, MEMORY_CURATE_DRY_RUN
     global MEMORY_CURATE_KEEP_FACTS, MEMORY_CURATE_BATCH_FACTS
     global MEMORY_CURATE_KEEP_SUMMARIES, MEMORY_CURATE_BATCH_SUMMARIES
+    global CURATE_MAX_TOKENS
     global MEMORY_PEER_MAX_FACTS, MEMORY_PEER_MAX_USERS, MEMORY_PRUNE_KEEP
     global MEMORY_RECALL_ENABLED, MEMORY_RECALL_LIMIT, MEMORY_SEMANTIC_RANK
     global MEMORY_SUMMARY_CHUNK, MEMORY_SUMMARY_CHUNK_TOKENS
@@ -193,6 +194,9 @@ def apply_config(cfg, initial=False):
     MEMORY_CURATE_BATCH_FACTS = cfg.get("memory_curate_batch_facts", 50)
     MEMORY_CURATE_KEEP_SUMMARIES = cfg.get("memory_curate_keep_summaries", 100)
     MEMORY_CURATE_BATCH_SUMMARIES = cfg.get("memory_curate_batch_summaries", 100)
+    # Curation emits a JSON index list over a whole batch, so it needs a
+    # larger output cap than a short conversation summary.
+    CURATE_MAX_TOKENS = cfg.get("curate_max_tokens", 4000)
     # Replied-to context replacing keyword recall for out-of-window parents:
     # how many preceding messages to include, and parent truncation budget.
     REPLY_CONTEXT_BEFORE = cfg.get("reply_context_before", 3)
@@ -1542,12 +1546,15 @@ async def generate_reply(messages, purpose="chat", debug_key=None):
                                  debug_key=debug_key)
 
 
-async def summary_generate(messages, purpose="summary"):
+async def summary_generate(messages, purpose="summary", max_tokens=None):
     """Background-job chain: local summary Ollama model → OpenRouter summary model.
 
     Never touches the main live-chat models. Fail-soft: returns None so
     the caller skips this cycle instead of burning quota on retries.
+    max_tokens overrides the summary default (curation emits a big JSON
+    index list and needs more headroom than a short summary).
     """
+    token_cap = max_tokens if max_tokens else SUMMARY_MAX_TOKENS
     if await asyncio.to_thread(is_ollama_model_loaded, SUMMARY_OLLAMA_MODEL):
         log.info("[summary] Using local Ollama model (%s)", SUMMARY_OLLAMA_MODEL)
 
@@ -1558,7 +1565,7 @@ async def summary_generate(messages, purpose="summary"):
             num_ctx=SUMMARY_OLLAMA_CTX,
             timeout=SUMMARY_OLLAMA_TIMEOUT,
             purpose=purpose,
-            num_predict=SUMMARY_MAX_TOKENS,
+            num_predict=token_cap,
         )
         if reply:
             return reply
@@ -1570,7 +1577,7 @@ async def summary_generate(messages, purpose="summary"):
         messages,
         SUMMARY_MODEL,
         temperature=SUMMARY_TEMPERATURE,
-        max_tokens=SUMMARY_MAX_TOKENS,
+        max_tokens=token_cap,
         timeout=SUMMARY_TIMEOUT,
         max_retries=SUMMARY_MAX_RETRIES,
         purpose=purpose,
@@ -2632,7 +2639,7 @@ async def curate_channel_summaries(channel_id):
             {"role": "system",
              "content": mem_summary.CURATION_SUMMARIES_SYSTEM},
             {"role": "user", "content": prompt},
-        ], purpose="curate")
+        ], purpose="curate", max_tokens=CURATE_MAX_TOKENS)
     except Exception:
         log.exception("[curate] summary judgment failed for %s", channel_id)
         return
@@ -2672,7 +2679,7 @@ async def curate_facts():
                 {"role": "system",
                  "content": mem_summary.CURATION_FACTS_SYSTEM},
                 {"role": "user", "content": prompt},
-            ], purpose="curate")
+            ], purpose="curate", max_tokens=CURATE_MAX_TOKENS)
         except Exception:
             log.exception("[curate] fact judgment failed for %s", uid)
             continue

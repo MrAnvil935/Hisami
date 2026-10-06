@@ -123,6 +123,9 @@
   "summary_input_chars": 500,
   // Same guard for the fact-extraction transcript.
   "fact_input_chars": 300,
+  // Max tokens for a curation call. Higher than summary_max_tokens because
+  // curation judges a whole batch and returns a JSON index list.
+  "curate_max_tokens": 4000,
   // Seconds per local summary request.
   "summary_ollama_timeout": 60,
   // Seconds per OpenRouter summary request.

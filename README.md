@@ -121,7 +121,8 @@ Tunable groups (all have built-in defaults, see `config.json`):
   Both models must be vision-capable (text-only models return nothing useful).
   `vision_ollama_ctx` should stay generous (default 8192): images consume
   hundreds of context tokens each and a small ctx truncates them silently.
-  `summary_max_tokens` / `vision_max_tokens` are enforced on both backends
+  `summary_max_tokens` / `vision_max_tokens` / `curate_max_tokens` are
+  enforced on both backends
   (Ollama `num_predict` included), so raise them on length failures.
 * `max_examples` / `examples_max_tokens` — style-example retrieval limits
 * `memory_*` — buffer size, summary chunk size, recall limits, cooldowns
@@ -203,7 +204,9 @@ prompt:
   judges one batch of the *oldest* rows (newest keep_* are exempt) and
   deletes only clearly stale/superseded facts or redundant/empty
   summaries — "when in doubt, keep". Runs on the local-first summary
-  chain (`purpose="curate"` in `llm.jsonl`), never the live model;
+  chain (`purpose="curate"` in `llm.jsonl`) with its own output cap
+  `curate_max_tokens` (default 4000, since it returns a whole batch's
+  index list), never the live model;
   `memory_curate_enabled` off or `memory_curate_dry_run` logs without
   deleting. Fail-soft: offline just leaves tables growing until next run.
 * **Image understanding** — the first image in a ping (upload, link, or
