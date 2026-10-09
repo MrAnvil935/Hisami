@@ -1249,6 +1249,46 @@ class ExamplesTest(unittest.TestCase):
         self.assertIn("Target Response:", fitted[0])
         self.assertNotIn("STYLE EXAMPLE", fitted[0])
 
+    def test_extract_style_snippets(self):
+        texts = [
+            "STYLE EXAMPLE (tone)\n\nContext:\nalice: hi\n\n"
+            "User Input:\nNone\n\nTarget Response:\nxd",
+            "HIGH VALUE INTERACTION (reply)\n\nTarget Response:\nlol ok",
+            "STYLE EXAMPLE\n\nContext:\n\n\nUser Input:\nNone\n\n"
+            "Target Response:\n",
+            "no response marker here",
+            "STYLE EXAMPLE\n\nTarget Response:\nxd",
+        ]
+        out = mem_examples.extract_style_snippets(texts)
+        # empties, marker-less records, and duplicate bodies dropped
+        self.assertEqual(out, ["xd", "lol ok"])
+
+    def test_extract_style_snippets_truncates_and_excludes(self):
+        long_body = "w" * 500
+        texts = [f"Target Response:\n{long_body}",
+                 "Target Response:\nkeep me"]
+        out = mem_examples.extract_style_snippets(
+            texts, exclude_texts={texts[1]}, max_chars=100)
+        self.assertEqual(len(out), 1)
+        self.assertLessEqual(len(out[0]), 101)  # 100 chars + ellipsis
+        self.assertTrue(out[0].endswith("…"))
+        # excluded record never contributes
+        self.assertNotIn("keep me", out)
+
+    def test_fit_style_snippets_budget_and_count(self):
+        snips = [f"snippet {i} " + "x" * 200 for i in range(10)]
+        fitted = mem_examples.fit_style_snippets(snips, 300, 40)
+        self.assertTrue(fitted)
+        self.assertEqual(fitted[0].split()[1], "0")  # rank order kept
+        total = sum(mem_buffer.estimate_tokens(s) + 2 for s in fitted)
+        self.assertLessEqual(total, 300)
+        # count cap applies even with a huge token budget
+        capped = mem_examples.fit_style_snippets(snips, 100000, 3)
+        self.assertEqual(len(capped), 3)
+        # tiny budget still keeps the top snippet
+        self.assertEqual(len(mem_examples.fit_style_snippets(snips, 1, 5)), 1)
+        self.assertEqual(mem_examples.fit_style_snippets([], 300, 5), [])
+
 
 class LlmLogTest(unittest.TestCase):
     def setUp(self):

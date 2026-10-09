@@ -91,6 +91,8 @@ def apply_config(cfg, initial=False):
     global EXAMPLES_MAX_TOKENS, FACT_INPUT_CHARS, FALLBACK_MODEL
     global LLM_DUMP_ENABLED, LOG_BACKUPS, LOG_DIR, LOG_FILE_LEVEL
     global LOG_MAX_BYTES, MASTER_PROMPT, MAX_EXAMPLES, MAX_HISTORY
+    global STYLE_EXAMPLES_POOL, STYLE_EXAMPLES_MAX_TOKENS
+    global STYLE_EXAMPLES_MAX_COUNT
     global MAX_OLLAMA_TOKENS, BUFFER_MERGE_GAP_SECONDS
     global MEMORY_BUFFER_MAX_MSGS, MEMORY_BUFFER_TOKENS
     global MEMORY_DB_PATH, MEMORY_ENGAGE_LOOKBACK, MEMORY_FACTS_ENABLED
@@ -151,6 +153,12 @@ def apply_config(cfg, initial=False):
     MAX_HISTORY = cfg["max_history"]
     MAX_EXAMPLES = cfg["max_examples"]
     EXAMPLES_MAX_TOKENS = cfg.get("examples_max_tokens", 1200)
+    # Context-free style snippets (Target Response lines) mined from
+    # lower-ranked retrieved examples; own pool + budget, never competes
+    # with the full examples.
+    STYLE_EXAMPLES_POOL = cfg.get("style_examples_pool", 40)
+    STYLE_EXAMPLES_MAX_TOKENS = cfg.get("style_examples_max_tokens", 1200)
+    STYLE_EXAMPLES_MAX_COUNT = cfg.get("style_examples_max_count", 40)
 
     OLLAMA_URL = cfg["ollama_url"]
     OLLAMA_MODEL = cfg["ollama_model"]
@@ -1093,8 +1101,13 @@ async def build_messages(channel_id, user_message, username, author_id="",
         exclude_ids.add(current_message_id)
 
     # Retrieval, web search and long-term memory are independent.
-    examples, web_block, memory_block = await asyncio.gather(
+    # style_candidates over-fetches the same ranking so lower-ranked
+    # examples can contribute context-free tone snippets (additive; the
+    # full-example set above is unchanged).
+    examples, style_candidates, web_block, memory_block = await asyncio.gather(
         asyncio.to_thread(retrieve_examples, channel_id, user_message),
+        asyncio.to_thread(retrieve_examples, channel_id, user_message,
+                          MAX_EXAMPLES + STYLE_EXAMPLES_POOL),
         get_web_context(channel_id, user_message),
         get_memory_context(channel_id, user_message, author_id, username,
                            reply_block, exclude_ids, bot_id, bot_name),
@@ -1115,6 +1128,24 @@ async def build_messages(channel_id, user_message, username, author_id="",
     else:
         examples_block = ""
         fitted = []
+
+    # Context-free style snippets from the lower-ranked candidates,
+    # excluding anything already used as a full example above. Own
+    # budget; empty when there is no index/overflow.
+    if style_candidates:
+        snippets = await asyncio.to_thread(
+            mem_examples.extract_style_snippets,
+            style_candidates, set(examples), 200)
+        fitted_snips = await asyncio.to_thread(
+            mem_examples.fit_style_snippets, snippets,
+            STYLE_EXAMPLES_MAX_TOKENS, STYLE_EXAMPLES_MAX_COUNT)
+        if fitted_snips:
+            examples_block += (
+                "Style-only snippets (bare reply lines from other "
+                "conversations — never reply to them, only imitate the "
+                "phrasing and tone):\n"
+                + "".join(f"- {s}\n" for s in fitted_snips)
+            )
 
     system_content = build_system_content(
         style_block, examples_block, memory_block, web_block)

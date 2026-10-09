@@ -126,7 +126,9 @@ Tunable groups (all have built-in defaults, see `config.json`):
   `summary_max_tokens` / `vision_max_tokens` / `curate_max_tokens` are
   enforced on both backends
   (Ollama `num_predict` included), so raise them on length failures.
-* `max_examples` / `examples_max_tokens` — style-example retrieval limits
+* `max_examples` / `examples_max_tokens` — style-example retrieval limits;
+  `style_examples_pool` / `style_examples_max_tokens` /
+  `style_examples_max_count` — context-free tone snippets
 * `memory_*` — buffer size, summary chunk size, recall limits, cooldowns
 * `search_*` — web search triggers and limits
 * `log_*` / `llm_dump_enabled` — debug logging verbosity and retention
@@ -274,7 +276,12 @@ The `system` message holds, in order:
 3. `Examples:` — top-ranked style examples (token-budgeted by
    `examples_max_tokens`, the only size limit), keeping each example's
    full Context / User Input / Target Response body and explicitly
-   framed as tone references that must never be answered
+   framed as tone references that must never be answered. After them a
+   `Style-only snippets` sub-block adds bare `Target Response` lines
+   from lower-ranked retrievals (`style_examples_pool` extra candidates,
+   capped by `style_examples_max_tokens` / `style_examples_max_count`)
+   for cheap tone/phrasing signal — additive; the full-example set is
+   unchanged and snippets never overlap a full example
 4. `Reference memory:` up to `memory_summary_limit` (default 2, newest
    half guaranteed) channel summaries, recalled messages or the
    reply-context block, and author/peer facts

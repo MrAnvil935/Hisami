@@ -206,6 +206,13 @@
   "max_examples": 20,
   // ...within this token budget (huge examples can't blow the prompt).
   "examples_max_tokens": 12000,
+  // Context-free style snippets pulled from lower-ranked retrieved
+  // examples (just the Target Response line). Cheap tone/phrasing signal
+  // with its own budget so it never crowds out the full examples.
+  // pool = extra examples retrieved beyond max_examples to mine snippets.
+  "style_examples_pool": 40,
+  "style_examples_max_tokens": 3000,
+  "style_examples_max_count": 40,
 
   // Display name used in /status.
   "botname": "Hisami",
