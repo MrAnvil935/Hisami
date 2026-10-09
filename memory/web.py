@@ -14,6 +14,28 @@ from bs4 import BeautifulSoup
 
 V2_TEXT_BUDGET = 3800
 
+_URL_RE = re.compile(r"https?://[^\s<>\"]+")
+_TRAILING_PUNCT = ".,;:!?)'\"*`"
+
+
+def extract_urls(text):
+    """Find http(s) URLs in free text, order-preserving and de-duplicated.
+
+    Trailing punctuation is stripped so 'see https://x.com.' yields the
+    bare URL, and markdown/angle brackets end the match. No extension
+    filtering — callers decide what is fetchable. Empty input -> [].
+    Pure function (no I/O).
+    """
+    if not text:
+        return []
+    out, seen = [], set()
+    for raw in _URL_RE.findall(str(text)):
+        url = raw.rstrip(_TRAILING_PUNCT)
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
 
 def format_web_results(results, max_chars=V2_TEXT_BUDGET):
     """Render search results as markdown for a TextDisplay component.
@@ -153,18 +175,27 @@ def format_prompt_sources(record, max_chars=V2_TEXT_BUDGET):
     """Render what the model was given for the /prompt results button.
 
     record: {"searched": bool, "queries": [...], "results": [...],
-    "fetched": {url: chars}}. Declined search -> short notice.
-    Over-budget output is truncated with a notice. Empty input -> ''.
+    "fetched": {url: chars}, "linked": {url: chars}}. Linked pages are
+    shown even when the router declined a search. Declined with no
+    linked pages -> short notice. Over-budget -> truncated notice.
+    Empty input -> ''.
     """
     if not record:
         return ""
-    if not record.get("searched", True):
+    linked = record.get("linked") or {}
+    parts = []
+    if not record.get("searched", True) and not linked:
         return ("The model decided no web search was needed "
                 "for this question.")
-    parts = []
     queries = record.get("queries") or []
     if queries:
         parts.append("Searched for: " + "; ".join(str(q) for q in queries))
+    if linked:
+        link_lines = [
+            f"- [{url}]({url}) — 📄 full page text was included in the prompt"
+            for url in linked
+        ]
+        parts.append("Linked pages fetched:\n" + "\n".join(link_lines))
     fetched = record.get("fetched") or {}
     lines = []
     for i, r in enumerate(record.get("results") or [], 1):

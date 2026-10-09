@@ -5,7 +5,7 @@ A Discord chatbot that mimics a specific user's chatting style using Retrieval-A
 The bot builds an embedding index from exported Discord messages and uses it as style examples during generation. It supports:
 
 * OpenRouter as the primary inference backend, Ollama as local-first option
-* Provider prompt caching disabled on every OpenRouter call
+* Optional provider prompt caching disabled on every OpenRouter call
   (`openrouter_no_cache`): stale warmed-up prefixes were making the bot
   ignore fresh conversation. Tradeoff: no cache-read discounts, every
   call bills full input price
@@ -17,11 +17,13 @@ The bot builds an embedding index from exported Discord messages and uses it as 
 * Web search (DuckDuckGo, 3 retries on failure) for questions about
   current events, plus a `/web` command showing raw results with no AI
   involved (result count 1–10, default 5)
-* `/prompt` with `web:True` runs an agentic flow: a small model
-  (local-first, `prompt_router_*`) decides if search is needed and
-  issues up to 2 queries, top result pages are fetched for full
-  article text, and the results button shows the queries plus what
-  the model was given
+* `/prompt` with `web:True` runs an agentic flow: any URL the user
+  pasted is fetched first, then a small model (local-first,
+  `prompt_router_*`) decides if search is needed and issues up to 2
+  queries, top result pages are fetched for full article text, and the
+  results button shows the queries plus what the model was given. The
+  Continue buttons open a modal; dismissing it leaves the conversation
+  usable (a failed generation re-enables them so it stays retryable).
 * Slash commands for status information and maintenance
 * Two-sink debug logging: concise terminal + full payloads on disk
 * Replies on @-mention in servers; in DMs every message gets a reply

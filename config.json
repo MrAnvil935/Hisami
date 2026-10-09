@@ -13,7 +13,7 @@
   // prefix caching). Stale caches can serve warmed-up prefixes that make
   // the bot ignore fresh conversation. Tradeoff: no cache-read discounts,
   // every call bills full input price. Flip off if a provider 400s.
-  "openrouter_no_cache": true,
+  "openrouter_no_cache": false,
 
   // Primary chat model (OpenRouter). Used when the local ollama_model
   // below is not loaded.
@@ -42,7 +42,7 @@
   // Recent-message window injected per reply. Token budget (below) and
   // message-count cap (next key) apply together; larger = more context
   // but bigger prompts.
-  "memory_buffer_tokens": 1500,
+  "memory_buffer_tokens": 3000,
   "memory_buffer_max_msgs": 30,
   // Consecutive messages from the same author within this many seconds
   // merge into one window slot, so a thought split across many messages
@@ -60,7 +60,7 @@
   "memory_summary_min_msgs": 10,
   // Conversation summaries injected per reply (newest half guaranteed,
   // rest relevance-ranked; 0 disables summaries).
-  "memory_summary_limit": 2,
+  "memory_summary_limit": 3,
   // Master switch for per-user fact extraction (live mention path excluded;
   // batched chunk extraction only). Facts of the author + peers inject.
   "memory_facts_enabled": true,
@@ -86,7 +86,7 @@
   "memory_curate_dry_run": false,
   // Minimum seconds between curation passes (per channel for summaries,
   // global for facts) so the loop can't spam near-useless model calls.
-  "memory_curate_cooldown_seconds": 3600,
+  "memory_curate_cooldown_seconds": 18000,
   // Newest N facts per user exempt from judgment.
   "memory_curate_keep_facts": 50,
   // How many of a user's oldest facts (beyond keep_facts) are judged per run.
@@ -125,16 +125,16 @@
   // Low temperature: summaries/facts must be deterministic, not creative.
   "summary_temperature": 0.2,
   // Max tokens per summary/fact call. Raise on length-related failures.
-  "summary_max_tokens": 800,
+  "summary_max_tokens": 3600,
   // Chars kept per message in the summarizer input transcript. Guards
   // prompt size against copypastas; the summary output is still bounded
   // by summary_max_tokens above.
-  "summary_input_chars": 500,
+  "summary_input_chars": 1500,
   // Same guard for the fact-extraction transcript.
-  "fact_input_chars": 300,
+  "fact_input_chars": 500,
   // Max tokens for a curation call. Higher than summary_max_tokens because
   // curation judges a whole batch and returns a JSON index list.
-  "curate_max_tokens": 4000,
+  "curate_max_tokens": 16000,
   // Seconds per local summary request.
   "summary_ollama_timeout": 60,
   // Seconds per OpenRouter summary request.
@@ -155,7 +155,7 @@
   "vision_temperature": 0.2,
   // Max tokens per description. Reasoning models spend output tokens on
   // thinking, so raise on length-related failures.
-  "vision_max_tokens": 1200,
+  "vision_max_tokens": 2500,
   // Context window for the local vision model. Images eat hundreds of
   // tokens each — a small ctx silently truncates them. Higher costs VRAM.
   "vision_ollama_ctx": 8192,
@@ -205,7 +205,7 @@
   // Style examples retrieved per reply (best-ranked kept first).
   "max_examples": 20,
   // ...within this token budget (huge examples can't blow the prompt).
-  "examples_max_tokens": 3000,
+  "examples_max_tokens": 12000,
 
   // Display name used in /status.
   "botname": "Hisami",
