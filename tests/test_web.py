@@ -61,6 +61,41 @@ class RouterParseTest(unittest.TestCase):
         self.assertEqual(qs, ["orig"])
 
 
+class UrlExtractTest(unittest.TestCase):
+    def test_finds_and_strips_trailing_punct(self):
+        self.assertEqual(
+            mem_web.extract_urls("see https://x.example/a."),
+            ["https://x.example/a"])
+        self.assertEqual(
+            mem_web.extract_urls("(https://x.example/b)"),
+            ["https://x.example/b"])
+
+    def test_markdown_and_angle_brackets(self):
+        self.assertEqual(
+            mem_web.extract_urls("[t](https://x.example/c) and <https://y.example/d>"),
+            ["https://x.example/c", "https://y.example/d"])
+        self.assertEqual(
+            mem_web.extract_urls("check **https://x.example/e** ok"),
+            ["https://x.example/e"])
+
+    def test_dedup_preserves_order(self):
+        self.assertEqual(
+            mem_web.extract_urls(
+                "https://a.example/1 https://b.example/2 https://a.example/1"),
+            ["https://a.example/1", "https://b.example/2"])
+
+    def test_no_urls_and_empty(self):
+        self.assertEqual(mem_web.extract_urls("no links here"), [])
+        self.assertEqual(mem_web.extract_urls(""), [])
+        self.assertEqual(mem_web.extract_urls(None), [])
+
+    def test_image_url_still_returned(self):
+        # no extension filtering: caller decides fetchability
+        self.assertEqual(
+            mem_web.extract_urls("https://x.example/pic.png"),
+            ["https://x.example/pic.png"])
+
+
 class ExtractTest(unittest.TestCase):
     ARTICLE = ("<html><head><title>t</title><script>evil()</script></head>"
                "<body><nav>menu menu</nav><article><h1>Head</h1>"
@@ -135,6 +170,13 @@ class PromptSourcesTest(unittest.TestCase):
             {"searched": False, "queries": [],
              "results": [], "fetched": {}})
         self.assertIn("no web search was needed", text)
+
+    def test_declined_with_linked_pages_shows_them(self):
+        record = {"searched": False, "queries": [], "results": [],
+                  "fetched": {}, "linked": {"https://a.example/x": 1200}}
+        text = mem_web.format_prompt_sources(record)
+        self.assertIn("Linked pages fetched:", text)
+        self.assertIn("https://a.example/x", text)
 
     def test_empty(self):
         self.assertEqual(mem_web.format_prompt_sources(None), "")
