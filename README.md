@@ -111,6 +111,11 @@ At minimum you'll need:
 Tunable groups (all have built-in defaults, see `config.json`):
 
 * `model` / `fallback_model` — main chat chain (local Ollama first, then OpenRouter)
+* `openrouter_providers` — optional per-model provider pinning: a map of
+  exact model slug to provider name (or ordered list of names). Pinned
+  models are sent with `provider.order` + `allow_fallbacks: false`, so a
+  request never silently routes to a different host; unlisted models stay
+  unrestricted
 * `ollama_autoload` — preload Ollama models at startup (default `false`;
   a 12b + vision + embed load can exceed VRAM unasked). The embedding model
   preloads whenever the server is up regardless of this flag; generation

@@ -78,6 +78,25 @@ def diff_configs(old, new):
 DEFAULT_OLLAMA_BASE = "http://localhost:11434"
 
 
+def provider_order_for(model, providers):
+    """Provider names to enforce for an OpenRouter model slug.
+
+    `providers` maps an exact model slug to a provider name or a list of
+    names in preference order. Returns the cleaned list, or [] when the
+    model is unrestricted. Pure function (no I/O) so it is unit-testable.
+    """
+    if not isinstance(providers, dict):
+        return []
+    entry = providers.get(str(model))
+    if not entry:
+        return []
+    if isinstance(entry, str):
+        entry = [entry]
+    if not isinstance(entry, (list, tuple)):
+        return []
+    return [str(p).strip() for p in entry if str(p).strip()]
+
+
 def ollama_base(url, default=DEFAULT_OLLAMA_BASE):
     """Derive the Ollama server base (scheme://host:port) from any URL form.
 

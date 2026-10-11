@@ -1540,6 +1540,29 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(base("not a url"), "http://localhost:11434")
         self.assertEqual(base("ftp://x/y"), "http://localhost:11434")
 
+    def test_provider_order_for(self):
+        mapping = {
+            "a/model:free": "NVIDIA",
+            "b/model:free": ["Nex AGI", " Together "],
+            "c/model:free": [],
+        }
+        # exact-slug match, string normalized to a one-item list
+        self.assertEqual(
+            mem_config.provider_order_for("a/model:free", mapping), ["NVIDIA"])
+        # list order preserved, entries trimmed, blanks dropped
+        self.assertEqual(
+            mem_config.provider_order_for("b/model:free", mapping),
+            ["Nex AGI", "Together"])
+        # empty entry and unmatched model stay unrestricted
+        self.assertEqual(
+            mem_config.provider_order_for("c/model:free", mapping), [])
+        self.assertEqual(
+            mem_config.provider_order_for("z/model:free", mapping), [])
+        # malformed inputs never raise
+        self.assertEqual(mem_config.provider_order_for("a", None), [])
+        self.assertEqual(mem_config.provider_order_for("a", "nope"), [])
+        self.assertEqual(mem_config.provider_order_for("a", {"a": 5}), [])
+
     def test_diff_configs(self):
         self.assertEqual(mem_config.diff_configs({"a": 1}, {"a": 1}), [])
         self.assertEqual(mem_config.diff_configs({"a": 1}, {"a": 2}), ["a"])

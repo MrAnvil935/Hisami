@@ -109,7 +109,7 @@ def apply_config(cfg, initial=False):
     global MEMORY_SUMMARY_MIN_MSGS, MODEL, OLLAMA_AUTOLOAD, OLLAMA_BASE
     global MEMORY_SUMMARY_LIMIT
     global OLLAMA_MODEL, OLLAMA_TIMEOUT, OLLAMA_URL, OPENROUTER_API_KEY
-    global OPENROUTER_HEADERS, OPENROUTER_NO_CACHE
+    global OPENROUTER_HEADERS, OPENROUTER_NO_CACHE, OPENROUTER_PROVIDERS
     global PROMPT_COMMAND_DESCRIPTION, PROMPT_COMMAND_NAME
     global PROMPT_FETCH_CHARS, PROMPT_FETCH_COUNT, PROMPT_FETCH_ENABLED
     global PROMPT_FETCH_MAX_BYTES, PROMPT_FETCH_TIMEOUT
@@ -146,6 +146,12 @@ def apply_config(cfg, initial=False):
     # automatic prefix caching elsewhere. Costs cache-read discounts —
     # every call bills full input price. Flip off if a provider 400s.
     OPENROUTER_NO_CACHE = cfg.get("openrouter_no_cache", True)
+    # Optional per-model provider pinning: {"<model slug>": "Provider"}
+    # or {"<model slug>": ["ProvA", "ProvB"]}. Enforced with no fallbacks
+    # so a request never silently routes to a different host. Models with
+    # no entry stay unrestricted.
+    _providers = cfg.get("openrouter_providers") or {}
+    OPENROUTER_PROVIDERS = dict(_providers) if isinstance(_providers, dict) else {}
 
     MASTER_PROMPT = cfg["master_prompt"]
     PROMPT_SYSTEM = cfg.get("prompt_system", "You are a helpful assistant.")
@@ -1413,6 +1419,14 @@ def _retry_delay(attempt, retry_after=None):
     return (1.5 ** attempt) + random.uniform(0, 1)
 
 
+def _openrouter_provider_for(model):
+    """Provider names to enforce for an OpenRouter model slug.
+
+    Delegates to the pure config helper; [] when unrestricted.
+    """
+    return mem_config.provider_order_for(model, OPENROUTER_PROVIDERS)
+
+
 async def openrouter_chat(messages, model, tag_as_fallback=False,
                           temperature=0.9, max_tokens=None,
                           timeout=None, max_retries=None, purpose="chat",
@@ -1430,6 +1444,15 @@ async def openrouter_chat(messages, model, tag_as_fallback=False,
     }
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+
+    providers = _openrouter_provider_for(model)
+    if providers:
+        # Pin to the configured provider(s) with no fallbacks so the
+        # request never silently routes to a different host.
+        payload["provider"] = {
+            "order": providers,
+            "allow_fallbacks": False,
+        }
 
     if OPENROUTER_NO_CACHE:
         # Documented off-switch for OpenAI GPT-5.6+ (explicit mode with

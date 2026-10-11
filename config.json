@@ -14,6 +14,14 @@
   // the bot ignore fresh conversation. Tradeoff: no cache-read discounts,
   // every call bills full input price. Flip off if a provider 400s.
   "openrouter_no_cache": false,
+  // Optional: pin OpenRouter models to specific provider(s) so requests
+  // never silently route to another host (sent as provider.order with
+  // allow_fallbacks=false). Keys are exact model slugs; values are a
+  // provider name or a list of names in preference order. Models without
+  // an entry stay unrestricted. Example:
+  //   "nvidia/nemotron-3-ultra-550b-a55b:free": "NVIDIA",
+  //   "nex-agi/nex-n2.5-mini:free": ["Nex AGI"],
+  "openrouter_providers": {},
 
   // Primary chat model (OpenRouter). Used when the local ollama_model
   // below is not loaded.
