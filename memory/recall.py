@@ -197,7 +197,8 @@ def split_recent_relevant(items, limit, time_key="updated_at", id_key=None,
     return recent + relevant
 
 
-def search_messages(channel_id, query, limit=5, exclude_ids=None):
+def search_messages(channel_id, query, limit=5, exclude_ids=None,
+                    exclude_authors=None):
     """Return up to `limit` past messages relevant to query.
 
     Each item: {msg_id, author_name, content, score}. Newest irrelevant
@@ -205,24 +206,35 @@ def search_messages(channel_id, query, limit=5, exclude_ids=None):
     exclude_ids (message ids already present in the live window) are
     filtered out so recall never re-injects context the prompt already
     has — including the message currently being answered.
+    exclude_authors (e.g. a blacklist) are skipped so their messages are
+    never recalled.
     """
     tokens = tokenize(query)
     if not tokens:
         return []
     excluded = {str(x) for x in (exclude_ids or ())}
+    excl = [str(a) for a in (exclude_authors or []) if str(a).strip()]
     con = sqlite3.connect(store.DB_PATH, timeout=10)
     con.row_factory = sqlite3.Row
     try:
         try:
-            rows = con.execute(
-                """SELECT channel_id, msg_id, author_name, content,
-                          rank AS score
-                   FROM messages_fts
-                   WHERE messages_fts MATCH ?
-                     AND channel_id = ?
-                   ORDER BY rank LIMIT ?""",
-                (_fts_query(tokens), str(channel_id), int(limit) * 3),
-            ).fetchall()
+            sql = ("""SELECT messages_fts.channel_id, messages_fts.msg_id,
+                             messages_fts.author_name, messages_fts.content,
+                             messages_fts.rank AS score
+                      FROM messages_fts
+                      JOIN messages m
+                        ON m.channel_id = messages_fts.channel_id
+                       AND m.msg_id = messages_fts.msg_id
+                      WHERE messages_fts MATCH ?
+                        AND messages_fts.channel_id = ?""")
+            params = [_fts_query(tokens), str(channel_id)]
+            if excl:
+                sql += (" AND m.author_id NOT IN (%s)"
+                        % ",".join("?" * len(excl)))
+                params.extend(excl)
+            sql += " ORDER BY messages_fts.rank LIMIT ?"
+            params.append(int(limit) * 3)
+            rows = con.execute(sql, params).fetchall()
             # FTS5 rank: more negative = better. Normalize for display.
             out = []
             for r in rows:
@@ -243,12 +255,15 @@ def search_messages(channel_id, query, limit=5, exclude_ids=None):
         # LIKE fallback (also used when FTS has no hits)
         likes = " OR ".join(["LOWER(content) LIKE ?"] * len(tokens))
         params = [f"%{t}%" for t in tokens]
-        rows = con.execute(
-            f"""SELECT channel_id, msg_id, author_name, content, 0.0 AS score
-                FROM messages WHERE channel_id=? AND ({likes})
-                ORDER BY msg_id DESC LIMIT ?""",
-            (str(channel_id), *params, int(limit) * 3),
-        ).fetchall()
+        sql = (f"""SELECT channel_id, msg_id, author_name, content, 0.0 AS score
+                   FROM messages WHERE channel_id=? AND ({likes})""")
+        qparams = [str(channel_id), *params]
+        if excl:
+            sql += " AND author_id NOT IN (%s)" % ",".join("?" * len(excl))
+            qparams.extend(excl)
+        sql += " ORDER BY msg_id DESC LIMIT ?"
+        qparams.append(int(limit) * 3)
+        rows = con.execute(sql, qparams).fetchall()
         return [dict(r) for r in rows
                 if str(r["msg_id"]) not in excluded][:int(limit)]
     finally:

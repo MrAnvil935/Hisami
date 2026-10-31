@@ -167,15 +167,18 @@ def merge_fragments(rows, max_gap_s=180, break_ids=None):
 
 
 def load_window(channel_id, budget_tokens=1500, max_messages=30,
-                fetch_limit=120, max_gap_s=180, break_ids=None):
+                fetch_limit=120, max_gap_s=180, break_ids=None,
+                exclude_authors=None):
     """Load most recent messages that fit into the token budget.
 
     Consecutive same-author user fragments are merged first, so a single
     thought split across many messages costs one window slot. break_ids
-    (e.g. the live message) stay standalone. Returns oldest->newest list.
+    (e.g. the live message) stay standalone. exclude_authors (e.g. a
+    blacklist) are dropped before merging. Returns oldest->newest list.
     Always keeps at least the newest message.
     """
-    recent = store.get_recent(channel_id, limit=fetch_limit)
+    recent = store.get_recent(channel_id, limit=fetch_limit,
+                              exclude_authors=exclude_authors)
     if not recent:
         return []
     units = merge_fragments(recent, max_gap_s, break_ids)

@@ -163,15 +163,20 @@ def add_message(channel_id, msg_id, author_id, author_name, role,
         con.close()
 
 
-def get_recent(channel_id, limit=50):
+def get_recent(channel_id, limit=50, exclude_authors=None):
+    ids = [str(a) for a in (exclude_authors or []) if str(a).strip()]
     con = _connect()
     try:
-        rows = con.execute(
-            """SELECT channel_id, msg_id, author_id, author_name, display_name,
-                      role, content, reply_to, created_at, attachments
-               FROM messages WHERE channel_id=? ORDER BY msg_id DESC LIMIT ?""",
-            (str(channel_id), int(limit)),
-        ).fetchall()
+        sql = ("SELECT channel_id, msg_id, author_id, author_name,"
+               " display_name, role, content, reply_to, created_at,"
+               " attachments FROM messages WHERE channel_id=?")
+        params = [str(channel_id)]
+        if ids:
+            sql += " AND author_id NOT IN (%s)" % ",".join("?" * len(ids))
+            params.extend(ids)
+        sql += " ORDER BY msg_id DESC LIMIT ?"
+        params.append(int(limit))
+        rows = con.execute(sql, params).fetchall()
     finally:
         con.close()
     # oldest -> newest
@@ -198,11 +203,13 @@ def get_message_count(channel_id):
         con.close()
 
 
-def get_messages_by_ids(channel_id, ids):
+def get_messages_by_ids(channel_id, ids, exclude_authors=None):
     """Bulk-fetch messages by id. Returns {msg_id: row dict}.
 
     Used to recover reply parents that fell outside the prompt window.
-    Empty input short-circuits without touching the DB.
+    Blacklisted authors are filtered out too, so an ignored user's
+    message never re-enters the prompt via a reply link. Empty input
+    short-circuits without touching the DB.
     """
     want = set()
     for i in ids or []:
@@ -212,15 +219,18 @@ def get_messages_by_ids(channel_id, ids):
             continue
     if not want:
         return {}
+    excl = [str(a) for a in (exclude_authors or []) if str(a).strip()]
     q = ",".join("?" for _ in want)
+    sql = (f"""SELECT msg_id, author_id, author_name, display_name, role,
+                      content, reply_to, created_at, attachments
+               FROM messages WHERE channel_id=? AND msg_id IN ({q})""")
+    params = [str(channel_id), *want]
+    if excl:
+        sql += " AND author_id NOT IN (%s)" % ",".join("?" * len(excl))
+        params.extend(excl)
     con = _connect()
     try:
-        rows = con.execute(
-            f"""SELECT msg_id, author_id, author_name, display_name, role,
-                       content, reply_to, created_at, attachments
-                FROM messages WHERE channel_id=? AND msg_id IN ({q})""",
-            (str(channel_id), *want),
-        ).fetchall()
+        rows = con.execute(sql, params).fetchall()
     finally:
         con.close()
     out = {}
@@ -765,7 +775,8 @@ def _estimate_tokens(text):
     return max(1, len(text) // 4)
 
 
-def get_unsummarized(channel_id, chunk_size=30, chunk_tokens=None, min_msgs=10):
+def get_unsummarized(channel_id, chunk_size=30, chunk_tokens=None, min_msgs=10,
+                     exclude_authors=None):
     """Return oldest unsummarized messages when a chunk is ready, else [].
 
     Ready means either:
@@ -773,15 +784,22 @@ def get_unsummarized(channel_id, chunk_size=30, chunk_tokens=None, min_msgs=10):
       - estimated tokens reached chunk_tokens (with at least min_msgs),
         so long verbose messages trigger summarization early instead of
         bloating the raw window.
+    exclude_authors (e.g. a blacklist) are skipped entirely, so their
+    messages never enter a summary.
     """
     upto = get_last_summary_upto(channel_id)
+    excl = [str(a) for a in (exclude_authors or []) if str(a).strip()]
+    sql = ("SELECT msg_id, author_id, author_name, role, content"
+           " FROM messages WHERE channel_id=? AND msg_id > ?")
+    params = [str(channel_id), int(upto)]
+    if excl:
+        sql += " AND author_id NOT IN (%s)" % ",".join("?" * len(excl))
+        params.extend(excl)
+    sql += " ORDER BY msg_id ASC LIMIT ?"
+    params.append(int(chunk_size))
     con = _connect()
     try:
-        rows = con.execute(
-            """SELECT msg_id, author_id, author_name, role, content FROM messages
-               WHERE channel_id=? AND msg_id > ? ORDER BY msg_id ASC LIMIT ?""",
-            (str(channel_id), int(upto), int(chunk_size)),
-        ).fetchall()
+        rows = con.execute(sql, params).fetchall()
     finally:
         con.close()
     rows = [dict(r) for r in rows]

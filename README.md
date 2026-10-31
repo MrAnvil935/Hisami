@@ -111,6 +111,15 @@ At minimum you'll need:
 Tunable groups (all have built-in defaults, see `config.json`):
 
 * `model` / `fallback_model` — main chat chain (local Ollama first, then OpenRouter)
+* `main_max_tokens` — output cap for both main OpenRouter models
+  (`0` = uncapped, the default; Ollama uses `ollama_max_tokens` instead)
+* `ignore_bots` — default `true` keeps today's behavior (other bots are
+  ignored). When `false`, bot messages are stored as visible participants
+  and flow into history, summaries and user facts, and a ping from another
+  bot gets a reply. The bot's own messages are always ignored.
+* `blacklist_user_ids` — user ids ignored entirely: not stored, not fed
+  into history/summaries/user-facts, no reply to their pings. Existing
+  rows already in the database are kept but hidden.
 * `openrouter_providers` — optional per-model provider pinning: a map of
   exact model slug to provider name (or ordered list of names). Pinned
   models are sent with `provider.order` + `allow_fallbacks: false`, so a
@@ -224,16 +233,20 @@ prompt:
   index list), never the live model;
   `memory_curate_enabled` off or `memory_curate_dry_run` logs without
   deleting. Fail-soft: offline just leaves tables growing until next run.
-* **Image understanding** — the first image in a ping (upload, link, or
-  replied-to message) is downscaled to 512px and described by a separate
-  local-first vision chain; descriptions are cached by source URL. The
+* **Image understanding** — the first image in a ping (upload, embedded
+  media such as a linked GIF, a link, or any of those in the replied-to
+  message) is downscaled to 512px and described by a separate local-first
+  vision chain; descriptions are cached by source URL. Embedded media
+  (`message.embeds`: image/gifv/video) counts like an upload — real media
+  only, so link-preview favicons are skipped — and `?format=`/known
+  GIF-CDN links are recognised even without a file extension. The
   description is appended to the *user turn* that carried the image as an
   `[Attached image … — contents described: …]` note (attribution tracks
-  whether it was the author's own upload/link or the replied-to message),
-  not buried in the system block, so the model reads it as part of the
-  message it must answer. Videos are never processed, but history lines
-  are annotated (`[image: foo.png]`, `[video: bar.mp4]`) so the model
-  knows media exists.
+  whether it was the author's own upload/embed/link or the replied-to
+  message), not buried in the system block, so the model reads it as part
+  of the message it must answer. Videos are never processed, but history
+  lines are annotated (`[image: foo.png]`, `[video: bar.mp4]`) so the
+  model knows media exists.
 * **Keyword recall** — FTS5 search over past messages, top 3 injected.
   Messages already in the live window (and the message being answered) are
   excluded, and the surviving excerpts are ordered chronologically under a

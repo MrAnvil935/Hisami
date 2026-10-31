@@ -7,6 +7,7 @@ unit-testable. Downloading + model calls live in bot.py.
 import hashlib
 import io
 import re
+from urllib.parse import unquote, urlsplit
 
 from PIL import Image
 
@@ -15,8 +16,33 @@ MAX_SIDE = 512
 _IMAGE_EXTS = ("png", "jpg", "jpeg", "gif", "webp")
 _VIDEO_EXTS = ("mp4", "mov", "webm", "avi", "mkv", "m4v")
 
+# CDNs that serve an image even when the path has no extension.
+_IMAGE_HOSTS = ("media.tenor.com", "c.tenor.com", "media.giphy.com",
+                "i.giphy.com")
+
 _URL_RE = re.compile(r"https?://[^\s<>\"]+")
 _TRAILING_PUNCT = ".,;:!?)'\""
+
+
+def _looks_like_image(url):
+    """True if a URL most likely serves an image.
+
+    Covers the extension form (path ends in an image ext), the query form
+    (e.g. pbs.twimg.com/...?format=jpg), and known GIF CDNs. Pure.
+    """
+    low = str(url or "").lower()
+    if not low:
+        return False
+    path = low.split("?", 1)[0]
+    if path.endswith(_IMAGE_EXTS):
+        return True
+    m = re.search(r"[?&]format=([a-z0-9]+)", low)
+    if m and m.group(1) in _IMAGE_EXTS:
+        return True
+    try:
+        return urlsplit(low).netloc in _IMAGE_HOSTS
+    except Exception:
+        return False
 
 
 def extract_image_urls(text):
@@ -26,19 +52,34 @@ def extract_image_urls(text):
     out = []
     for raw in _URL_RE.findall(str(text)):
         url = raw.rstrip(_TRAILING_PUNCT)
-        path = url.split("?", 1)[0].lower()
-        if path.endswith(_IMAGE_EXTS):
+        if _looks_like_image(url):
             out.append(url)
     return out
 
 
 def _kind_from_name(filename):
     name = str(filename or "").lower()
-    if name.endswith(_IMAGE_EXTS):
+    path = name.split("?", 1)[0]
+    if path.endswith(_IMAGE_EXTS):
         return "image"
-    if name.endswith(_VIDEO_EXTS):
+    if path.endswith(_VIDEO_EXTS):
         return "video"
+    m = re.search(r"[?&]format=([a-z0-9]+)", name)
+    if m:
+        if m.group(1) in _IMAGE_EXTS:
+            return "image"
+        if m.group(1) in _VIDEO_EXTS:
+            return "video"
     return ""
+
+
+def _name_from_url(url, fallback="image"):
+    """Basename of a URL path for display, or `fallback` when empty."""
+    try:
+        base = unquote(urlsplit(str(url)).path.rsplit("/", 1)[-1])
+        return base or fallback
+    except Exception:
+        return fallback
 
 
 def classify_attachments(attachments):
@@ -62,6 +103,62 @@ def classify_attachments(attachments):
             kind = _kind_from_name(name)
         if kind:
             out.append({"kind": kind, "name": name, "url": url})
+    return out
+
+
+def classify_embeds(embeds):
+    """Discord Embed list -> [{kind, name, url}] (images/videos only).
+
+    Handles media Discord renders inside an embed (linked GIFs, images,
+    gifv). Per embed: always take `image.url`; take `thumbnail.url` only
+    for real-media embeds (image/gifv/video — a gifv thumbnail is a real
+    frame), never for rich/link/article previews (usually a favicon); take
+    `video.url` as video. Extension/`format=` decides the kind, with the
+    embed type as fallback. Duplicate URLs are dropped. Pure (no I/O).
+    """
+    out, seen = [], set()
+    for i, emb in enumerate(embeds or (), 1):
+        etype = str(getattr(emb, "type", "") or "").lower()
+        image = getattr(emb, "image", None)
+        thumb = getattr(emb, "thumbnail", None)
+        video = getattr(emb, "video", None)
+        cands = []
+        iurl = getattr(image, "url", "") if image is not None else ""
+        if iurl:
+            cands.append(("image", iurl))
+        if etype in ("image", "gifv", "video"):
+            turl = getattr(thumb, "url", "") if thumb is not None else ""
+            if turl:
+                cands.append(("image", turl))
+        vurl = getattr(video, "url", "") if video is not None else ""
+        if vurl:
+            cands.append(("video", vurl))
+        for hint, url in cands:
+            url = str(url or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            kind = _kind_from_name(url) or hint
+            out.append({"kind": kind, "name": _name_from_url(url,
+                                                             f"embed-{i}"),
+                        "url": url})
+    return out
+
+
+def collect_media(attachments, embeds):
+    """Merge attachment + embed media into one de-duplicated list.
+
+    Order is attachments first, then embeds (each source's own order), so
+    the first image found is deterministic. Pure (no I/O).
+    """
+    out, seen = [], set()
+    for item in list(classify_attachments(attachments)) + \
+            list(classify_embeds(embeds)):
+        url = item.get("url")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(item)
     return out
 
 

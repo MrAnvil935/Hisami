@@ -29,6 +29,10 @@
   // Last-resort chat model when the primary fails. Replies are tagged
   // with the model name so you can tell the fallback fired.
   "fallback_model": "openrouter/free",
+  // Output cap for BOTH main OpenRouter models above (0 = uncapped, the
+  // default). Only the OpenRouter chat chain; the local Ollama model uses
+  // ollama_max_tokens (its context window) instead.
+  "main_max_tokens": 0,
 
   // Ollama chat endpoint (OpenAI-compatible /api/chat).
   "ollama_url": "http://localhost:11434/api/chat",
@@ -210,6 +214,15 @@
   // Recent messages /lobotomy forgets (unsticks looping models).
   // Summaries and facts are intentionally preserved.
   "max_history": 30,
+  // Ignore messages from other bots by default (current behavior). When
+  // false, bot messages are stored as visible participants and flow into
+  // history, summaries and user facts; the bot then also replies when a
+  // pinged by another bot. The bot's own messages are always ignored.
+  "ignore_bots": true,
+  // User ids to ignore entirely: their messages are not stored, not fed
+  // into history, summaries or user facts, and pings from them get no
+  // reply. Existing rows already in the database are kept but hidden.
+  "blacklist_user_ids": [],
   // Style examples retrieved per reply (best-ranked kept first).
   "max_examples": 20,
   // ...within this token budget (huge examples can't blow the prompt).

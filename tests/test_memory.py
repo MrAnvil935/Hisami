@@ -69,6 +69,34 @@ class StoreTest(TempDBMixin, unittest.TestCase):
         rows = mem_store.get_recent("c9", 5)
         self.assertEqual(rows[0]["author_id"], "u1")
 
+    def test_recent_exclude_authors(self):
+        mem_store.add_message("ce", 1, "u1", "alice", "user", "hi")
+        mem_store.add_message("ce", 2, "u9", "mallory", "user", "secret")
+        mem_store.add_message("ce", 3, "u1", "alice", "user", "again")
+        rows = mem_store.get_recent("ce", 10, exclude_authors=["u9"])
+        self.assertEqual([r["msg_id"] for r in rows], [1, 3])
+        # empty/None exclude list is a no-op
+        self.assertEqual(len(mem_store.get_recent("ce", 10)), 3)
+        self.assertEqual(
+            len(mem_store.get_recent("ce", 10, exclude_authors=[])), 3)
+
+    def test_unsummarized_exclude_authors(self):
+        for i in range(1, 7):
+            mem_store.add_message("cu", i, "u1", "alice", "user", f"m{i}")
+            mem_store.add_message("cu", 100 + i, "u9", "mallory", "user",
+                                  f"s{i}")
+        chunk = mem_store.get_unsummarized(
+            "cu", chunk_size=5, min_msgs=1, exclude_authors=["u9"])
+        self.assertEqual(len(chunk), 5)
+        self.assertTrue(all(r["author_id"] != "u9" for r in chunk))
+
+    def test_get_messages_by_ids_exclude_authors(self):
+        mem_store.add_message("cm", 1, "u1", "alice", "user", "keep")
+        mem_store.add_message("cm", 2, "u9", "mallory", "user", "drop")
+        got = mem_store.get_messages_by_ids(
+            "cm", [1, 2], exclude_authors=["u9"])
+        self.assertEqual(set(got.keys()), {1})
+
     def test_display_name_round_trip(self):
         mem_store.add_message("cd", 1, "u1", "alice", "user", "hello",
                               display_name="Ali")
@@ -733,6 +761,15 @@ class BufferTest(TempDBMixin, unittest.TestCase):
         self.assertEqual(turns[0]["content"], "alice: ping @Assistant")
         self.assertEqual(turns[-1]["content"], "bob: and @Assistant?")
 
+    def test_load_window_exclude_authors(self):
+        mem_store.add_message("cw", 1, "u1", "alice", "user", "hi there")
+        mem_store.add_message("cw", 2, "u9", "mallory", "user", "secret")
+        mem_store.add_message("cw", 3, "u1", "alice", "user", "again")
+        win = mem_buffer.load_window("cw", fetch_limit=20, max_messages=20,
+                                     exclude_authors=["u9"])
+        self.assertTrue(win)
+        self.assertTrue(all(r["author_id"] != "u9" for r in win))
+
 
 class RecallTest(TempDBMixin, unittest.TestCase):
     def test_fts_recall(self):
@@ -758,6 +795,23 @@ class RecallTest(TempDBMixin, unittest.TestCase):
             "cx", "minecraft skyblock", exclude_ids={1})
         self.assertTrue(hits)
         self.assertTrue(all(h["msg_id"] != 1 for h in hits))
+
+    def test_search_messages_exclude_authors(self):
+        # both the FTS and LIKE paths must drop blacklisted authors
+        mem_store.add_message("cb", 1, "u1", "alice", "user",
+                              "minecraft skyblock server down")
+        mem_store.add_message("cb", 2, "u9", "mallory", "user",
+                              "minecraft skyblock leak")
+        hits = mem_recall.search_messages("cb", "minecraft skyblock")
+        self.assertEqual(len(hits), 2)
+        hits = mem_recall.search_messages(
+            "cb", "minecraft skyblock", exclude_authors=["u9"])
+        self.assertTrue(hits)
+        self.assertTrue(all(h["msg_id"] != 2 for h in hits))
+        # empty exclude list is a no-op
+        self.assertEqual(
+            len(mem_recall.search_messages(
+                "cb", "minecraft skyblock", exclude_authors=[])), 2)
 
     def test_select_recall_chronological_and_filtered(self):
         recalled = [
@@ -1443,6 +1497,61 @@ class VisionTest(unittest.TestCase):
         self.assertEqual(
             [(a["kind"], a["name"]) for a in out],
             [("image", "a.png"), ("video", "b.mp4"), ("image", "d.jpg")])
+
+    def test_extract_image_urls_query_format_and_hosts(self):
+        # ?format=jpg (no extension in path) and known GIF CDNs
+        text = ("https://pbs.twimg.com/media/ABC?format=jpg&name=large "
+                "https://media.tenor.com/xyz/tenor.gif "
+                "https://example.com/page.html")
+        self.assertEqual(
+            mem_vision.extract_image_urls(text),
+            ["https://pbs.twimg.com/media/ABC?format=jpg&name=large",
+             "https://media.tenor.com/xyz/tenor.gif"])
+
+    def test_classify_embeds(self):
+        from types import SimpleNamespace as NS
+        embeds = [
+            NS(type="gifv",
+               image=NS(url="https://media.tenor.com/a/tenor.gif"),
+               thumbnail=NS(url="https://media.tenor.com/a/frame.jpg"),
+               video=NS(url="https://media.tenor.com/a/tenor.mp4")),
+            NS(type="rich",
+               image=NS(url="https://site.test/pic.png"),
+               thumbnail=NS(url="https://site.test/favicon.png"),
+               video=None),
+            NS(type="link", image=None,
+               thumbnail=NS(url="https://site.test/favicon.png"),
+               video=None),
+        ]
+        out = mem_vision.classify_embeds(embeds)
+        # gifv: gif + its frame + mp4(video); rich: inline image only
+        # (favicon skipped); link: thumbnail-only ignored entirely
+        self.assertEqual(
+            [(a["kind"], a["name"]) for a in out],
+            [("image", "tenor.gif"), ("image", "frame.jpg"),
+             ("video", "tenor.mp4"), ("image", "pic.png")])
+
+    def test_classify_embeds_dedup_and_empty(self):
+        from types import SimpleNamespace as NS
+        same = "https://media.tenor.com/a/tenor.gif"
+        embeds = [NS(type="gifv", image=NS(url=same),
+                     thumbnail=NS(url=same), video=None)]
+        self.assertEqual(len(mem_vision.classify_embeds(embeds)), 1)
+        self.assertEqual(mem_vision.classify_embeds(None), [])
+        self.assertEqual(mem_vision.classify_embeds([]), [])
+
+    def test_collect_media_merges_and_dedups(self):
+        from types import SimpleNamespace as NS
+        atts = [NS(content_type="image/png", filename="a.png",
+                   url="https://cdn/a.png")]
+        embeds = [NS(type="image", image=NS(url="https://cdn/a.png"),
+                     thumbnail=None, video=None),
+                  NS(type="image", image=NS(url="https://cdn/b.png"),
+                     thumbnail=None, video=None)]
+        out = mem_vision.collect_media(atts, embeds)
+        self.assertEqual([a["url"] for a in out],
+                         ["https://cdn/a.png", "https://cdn/b.png"])
+        self.assertEqual(mem_vision.collect_media([], []), [])
 
     def test_downscale(self):
         from PIL import Image

@@ -91,6 +91,7 @@ def apply_config(cfg, initial=False):
     global EXAMPLES_MAX_TOKENS, FACT_INPUT_CHARS, FALLBACK_MODEL
     global LLM_DUMP_ENABLED, LOG_BACKUPS, LOG_DIR, LOG_FILE_LEVEL
     global LOG_MAX_BYTES, MASTER_PROMPT, MAX_EXAMPLES, MAX_HISTORY
+    global MAIN_MAX_TOKENS, IGNORE_BOTS, BLACKLIST_USER_IDS
     global STYLE_EXAMPLES_POOL, STYLE_EXAMPLES_MAX_TOKENS
     global STYLE_EXAMPLES_MAX_COUNT
     global MAX_OLLAMA_TOKENS, BUFFER_MERGE_GAP_SECONDS
@@ -141,6 +142,18 @@ def apply_config(cfg, initial=False):
     OPENROUTER_API_KEY = cfg["openrouter_api_key"]
     MODEL = cfg.get("model", "openrouter/free")
     FALLBACK_MODEL = cfg["fallback_model"]
+    # Output cap for both main OpenRouter models (0 = uncapped).
+    _main_max = cfg.get("main_max_tokens", 0)
+    try:
+        MAIN_MAX_TOKENS = int(_main_max)
+    except (TypeError, ValueError):
+        MAIN_MAX_TOKENS = 0
+    # Bot visibility + user blacklist (applied at runtime, /reload-able).
+    IGNORE_BOTS = cfg.get("ignore_bots", True)
+    BLACKLIST_USER_IDS = {
+        str(x).strip() for x in (cfg.get("blacklist_user_ids") or [])
+        if x is not None and str(x).strip()
+    }
     # Disable provider prompt caching on every OpenRouter call: documented
     # explicit-mode opt-out (OpenAI 5.6+) plus a per-request nonce busting
     # automatic prefix caching elsewhere. Costs cache-read discounts —
@@ -491,6 +504,7 @@ def _history_compat(channel_id, current_message_id=None):
         max_messages=MEMORY_BUFFER_MAX_MSGS,
         max_gap_s=BUFFER_MERGE_GAP_SECONDS,
         break_ids={current_message_id} if current_message_id else None,
+        exclude_authors=BLACKLIST_USER_IDS,
     )
     return [
         {
@@ -627,7 +641,10 @@ def keyword_search(search_text, k):
     return results[:k]
 
 
-def retrieve_examples(channel_id, user_message, limit=MAX_EXAMPLES):
+def retrieve_examples(channel_id, user_message, limit=None):
+    # Resolved at call time (not a bound default) so /reload takes effect.
+    if limit is None:
+        limit = MAX_EXAMPLES
     if not indexed_texts:
         return []
 
@@ -806,12 +823,15 @@ def _web_search_once(query, max_results):
     return "ok", _parse_html_results(r.text, max_results)
 
 
-def web_search(query, max_results=SEARCH_MAX_RESULTS):
+def web_search(query, max_results=None):
     """Blocking — call from async code with asyncio.to_thread().
 
     Retries transport/parse failures (e.g. connection resets) up to
     SEARCH_MAX_RETRIES total attempts. Bot-blocks are NOT retried.
+    max_results resolves at call time so /reload takes effect.
     """
+    if max_results is None:
+        max_results = SEARCH_MAX_RESULTS
     for attempt in range(1, SEARCH_MAX_RETRIES + 1):
         try:
             status, results = _web_search_once(query, max_results)
@@ -953,14 +973,16 @@ async def get_memory_context(channel_id, user_message, author_id="",
                 query_vec),
             asyncio.to_thread(
                 mem_recall.search_messages, channel_id, user_message,
-                MEMORY_RECALL_LIMIT, exclude_ids) if MEMORY_RECALL_ENABLED
-            else asyncio.sleep(0, result=[]),
+                MEMORY_RECALL_LIMIT, exclude_ids, BLACKLIST_USER_IDS)
+            if MEMORY_RECALL_ENABLED else asyncio.sleep(0, result=[]),
             asyncio.to_thread(
                 mem_store.get_facts, author_id, MEMORY_FACT_LIMIT,
                 user_message, query_vec)
-            if (MEMORY_FACTS_ENABLED and author_id) else asyncio.sleep(0, result=[]),
+            if (MEMORY_FACTS_ENABLED and author_id
+                and author_id not in BLACKLIST_USER_IDS)
+            else asyncio.sleep(0, result=[]),
             asyncio.to_thread(
-                mem_store.get_recent, channel_id, 15)
+                mem_store.get_recent, channel_id, 15, BLACKLIST_USER_IDS)
             if MEMORY_FACTS_ENABLED else asyncio.sleep(0, result=[]),
         )
     except Exception:
@@ -984,7 +1006,7 @@ async def get_memory_context(channel_id, user_message, author_id="",
                 # answer can never detach from its question.
                 rows = await asyncio.to_thread(
                     mem_store.get_messages_by_ids, channel_id,
-                    {r["msg_id"] for r in kept})
+                    {r["msg_id"] for r in kept}, BLACKLIST_USER_IDS)
                 enriched, parent_ids = [], set()
                 for r in kept:
                     row = rows.get(r.get("msg_id")) or {}
@@ -998,7 +1020,7 @@ async def get_memory_context(channel_id, user_message, author_id="",
                 if parent_ids:
                     parents = await asyncio.to_thread(
                         mem_store.get_messages_by_ids, channel_id,
-                        parent_ids)
+                        parent_ids, BLACKLIST_USER_IDS)
                 texts = [r.get("content", "") for r in enriched]
                 texts += [p.get("content", "") for p in parents.values()]
                 rec_names = await build_mention_names(channel_id, texts)
@@ -1022,6 +1044,7 @@ async def get_memory_context(channel_id, user_message, author_id="",
             peer_ids, peer_names = mem_recall.find_referenced_users(
                 recent, author_id, user_message, MEMORY_PEER_MAX_USERS,
                 bot_id)
+            peer_ids = [u for u in peer_ids if u not in BLACKLIST_USER_IDS]
             if peer_ids:
                 peer_facts = await asyncio.gather(*[
                     asyncio.to_thread(
@@ -1147,7 +1170,7 @@ async def build_messages(channel_id, user_message, username, author_id="",
             STYLE_EXAMPLES_MAX_TOKENS, STYLE_EXAMPLES_MAX_COUNT)
         if fitted_snips:
             examples_block += (
-                "Style-only snippets (bare reply lines from other "
+                "\n\nStyle-only snippets (bare reply lines from other "
                 "conversations — never reply to them, only imitate the "
                 "phrasing and tone):\n"
                 + "".join(f"- {s}\n" for s in fitted_snips)
@@ -1171,7 +1194,8 @@ async def build_messages(channel_id, user_message, username, author_id="",
     if missing:
         try:
             fetched = await asyncio.to_thread(
-                mem_store.get_messages_by_ids, channel_id, missing)
+                mem_store.get_messages_by_ids, channel_id, missing,
+                BLACKLIST_USER_IDS)
         except Exception:
             log.exception("reply parent backfill failed")
             fetched = {}
@@ -1598,6 +1622,7 @@ async def generate_reply(messages, purpose="chat", debug_key=None):
     log.info("[generate] Using OpenRouter (%s)", MODEL)
 
     reply = await openrouter_chat(messages, MODEL, purpose=purpose,
+                                  max_tokens=(MAIN_MAX_TOKENS or None),
                                   debug_key=debug_key)
     if reply:
         return reply
@@ -1606,6 +1631,7 @@ async def generate_reply(messages, purpose="chat", debug_key=None):
 
     return await openrouter_chat(messages, FALLBACK_MODEL,
                                  tag_as_fallback=True, purpose=purpose,
+                                 max_tokens=(MAIN_MAX_TOKENS or None),
                                  debug_key=debug_key)
 
 
@@ -1800,16 +1826,19 @@ async def resolve_reply_target(message):
 async def resolve_prompt_image(message, target=None):
     """Find the FIRST image for a ping, or (None, None, "").
 
-    Order: own uploads → links in own text → replied-to message's
-    uploads/links. Returns (cache_key, url, source) where source is a
-    short origin phrase for the prompt note, so a replied-to image is
-    never attributed to the current author. Videos are never returned
-    here (annotation only). Pass a pre-resolved target to avoid a
-    second fetch.
+    Order: own uploads/embeds → links in own text → replied-to message's
+    uploads/embeds/links. Embedded media (Discord link/GIF embeds) is
+    treated like an upload so linked GIFs are described too. Returns
+    (cache_key, url, source) where source is a short origin phrase for
+    the prompt note, so a replied-to image is never attributed to the
+    current author. Videos are never returned here (annotation only).
+    Pass a pre-resolved target to avoid a second fetch.
     """
     author = str(getattr(message, "author", "") or "the user")
-    atts = mem_vision.classify_attachments(getattr(message, "attachments", []))
-    for a in atts:
+    media = mem_vision.collect_media(
+        getattr(message, "attachments", []),
+        getattr(message, "embeds", []))
+    for a in media:
         if a["kind"] == "image":
             return mem_vision.cache_key(a["url"]), a["url"], f"attached by {author}"
 
@@ -1820,9 +1849,10 @@ async def resolve_prompt_image(message, target=None):
         target = await resolve_reply_target(message)
 
     if target is not None:
-        atts = mem_vision.classify_attachments(
-            getattr(target, "attachments", []))
-        for a in atts:
+        media = mem_vision.collect_media(
+            getattr(target, "attachments", []),
+            getattr(target, "embeds", []))
+        for a in media:
             if a["kind"] == "image":
                 return (mem_vision.cache_key(a["url"]), a["url"],
                         "from the message being replied to")
@@ -1874,7 +1904,8 @@ async def build_reply_context_block(channel_id, message, target, window_ids,
     previous = []
     try:
         rows = await asyncio.to_thread(
-            mem_store.get_messages_by_ids, channel_id, [parent_id])
+            mem_store.get_messages_by_ids, channel_id, [parent_id],
+            BLACKLIST_USER_IDS)
         parent = rows.get(parent_id)
         if parent is not None:
             parent = {
@@ -1902,12 +1933,14 @@ async def build_reply_context_block(channel_id, message, target, window_ids,
                     before=target, limit=REPLY_CONTEXT_BEFORE)]
                 previous = []
                 for hm in reversed(hist):
+                    hm_media = mem_vision.collect_media(
+                        getattr(hm, "attachments", []),
+                        getattr(hm, "embeds", []))
                     row = _normalize_fetched(
                         getattr(hm, "author", None),
                         getattr(hm, "content", ""),
                         getattr(hm, "id", 0),
-                        mem_vision.classify_attachments(
-                            getattr(hm, "attachments", [])))
+                        hm_media)
                     previous.append(row)
                     # store for memory continuity (idempotent upsert)
                     await asyncio.to_thread(
@@ -1915,8 +1948,7 @@ async def build_reply_context_block(channel_id, message, target, window_ids,
                         row["author_name"],
                         "assistant" if row["role"] == "assistant" else "user",
                         row["content"], None, row["author_id"],
-                        mem_vision.classify_attachments(
-                            getattr(hm, "attachments", [])),
+                        hm_media,
                         row.get("display_name", ""))
                 await asyncio.to_thread(
                     add_message, channel_id,
@@ -1924,8 +1956,9 @@ async def build_reply_context_block(channel_id, message, target, window_ids,
                     "assistant" if bool(getattr(t_author, "bot", False))
                     else "user",
                     t_content, None, str(getattr(t_author, "id", "")),
-                    mem_vision.classify_attachments(
-                        getattr(target, "attachments", [])),
+                    mem_vision.collect_media(
+                        getattr(target, "attachments", []),
+                        getattr(target, "embeds", [])),
                     str(getattr(t_author, "display_name", "") or ""))
         except Exception:
             log.exception("reply context Discord fetch failed")
@@ -2615,7 +2648,8 @@ async def summarize_channel(channel_id):
     """Summarize one chunk of unsummarized messages for a channel."""
     chunk = await asyncio.to_thread(
         mem_store.get_unsummarized, channel_id, MEMORY_SUMMARY_CHUNK,
-        MEMORY_SUMMARY_CHUNK_TOKENS, MEMORY_SUMMARY_MIN_MSGS)
+        MEMORY_SUMMARY_CHUNK_TOKENS, MEMORY_SUMMARY_MIN_MSGS,
+        BLACKLIST_USER_IDS)
     if not chunk:
         return False
     try:
@@ -2885,7 +2919,8 @@ async def memory_maintenance_loop():
                     # only touch channels with recent unsummarized backlog
                     chunk = await asyncio.to_thread(
                         mem_store.get_unsummarized, ch.id, MEMORY_SUMMARY_CHUNK,
-                        MEMORY_SUMMARY_CHUNK_TOKENS, MEMORY_SUMMARY_MIN_MSGS)
+                        MEMORY_SUMMARY_CHUNK_TOKENS, MEMORY_SUMMARY_MIN_MSGS,
+                        BLACKLIST_USER_IDS)
                     if chunk:
                         await summarize_channel(ch.id)
                         await asyncio.sleep(2)  # don't hammer the LLM
@@ -3303,7 +3338,19 @@ async def on_ready():
 @client.event
 async def on_message(message):
 
-    if message.author.bot:
+    # Never react to our own messages (loop guard) — applies whether or
+    # not other bots are ignored.
+    if client.user is not None and message.author.id == client.user.id:
+        return
+
+    # Blacklisted users are fully ignored: not stored, not recalled, and
+    # pings from them get no reply. Existing DB rows are kept but hidden.
+    if str(message.author.id) in BLACKLIST_USER_IDS:
+        return
+
+    # Other bots are ignored by default; when ignore_bots is off they are
+    # stored as visible participants (role "user") and may trigger a ping.
+    if IGNORE_BOTS and message.author.bot:
         return
 
     reply_to = None
@@ -3312,8 +3359,9 @@ async def on_message(message):
         reply_to = message.reference.message_id
 
     _track_channel(message.channel.id)
-    msg_attachments = mem_vision.classify_attachments(
-        getattr(message, "attachments", []))
+    msg_attachments = mem_vision.collect_media(
+        getattr(message, "attachments", []),
+        getattr(message, "embeds", []))
     await asyncio.to_thread(
         add_message,
         message.channel.id,
