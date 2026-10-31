@@ -1,0 +1,24 @@
+# virtualenv
+venv/
+
+# debug logs (may contain conversation text)
+logs/
+
+# runtime memory DB
+*.db
+*.db-wal
+*.db-shm
+
+# embedding artifacts (built locally via embed.py)
+index.bin
+texts.json
+dataset.jsonl
+export.json
+
+# static style profile (persona-specific, generated locally)
+style_profile.txt
+
+# local archives
+*.tar.xz
+
+__pycache__/
